@@ -3151,6 +3151,29 @@ async def _pb_pick_session(query, chat_id: str, thread_id: Optional[int],
     # Tapping the ALREADY-active session must not inject a /resume — the core
     # would reply "already in session" noise on every pointless re-tap.
     prev_sid = str((_pb_binding(chat_id, thread_id) or {}).get("session_id") or "").strip()
+    if prev_sid and prev_sid != session_id:
+        # One turn per session (flat chat): switching while the CURRENT
+        # session's turn runs would hit the core's busy guard with a raw
+        # reply anchored to the panel — intercept with a clear instruction.
+        state_conn = _sessions_state_conn()
+        try:
+            busy = _pb_session_status(state_conn, prev_sid) == "online"
+        except Exception:
+            busy = False
+        finally:
+            with _suppress(Exception):
+                state_conn.close()
+        if busy:
+            _pb_write_binding_session(chat_id, thread_id, session_id)  # pending pick
+            with _suppress(Exception):
+                await query.edit_message_text(
+                    f"⏳ Идёт ход в текущей сессии ({_pb_short_session_id(prev_sid)}). "
+                    f"«{_pb_short_session_id(session_id)}» выбрана следующей: дождись ответа "
+                    "или нажми [⏹ Stop] на панели — следующее сообщение уйдёт уже в неё.",
+                    reply_markup=_pb_back_keyboard())
+            with _suppress(Exception):
+                await query.answer()
+            return
     _pb_write_binding_session(chat_id, thread_id, session_id)
     if prev_sid != session_id:
         await _do_resume_by_id(query, session_id)

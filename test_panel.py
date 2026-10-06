@@ -656,6 +656,19 @@ class PanelCallbackTests(_StubbedTestCase):
         self.assertEqual(query.edits[-1][0],
                          f"📁  NeiroSlop\n🧵  20261003_062… · 12 msg · idle\n📂  {CWD}")
 
+    def test_sesss_pick_while_busy_defers_switch(self):
+        # One turn per session: switching while the current session's turn
+        # runs must NOT inject /resume — the pick is recorded and the next
+        # message steers the lane onto it.
+        _STATE_DATA["topic_bindings"] = {KEY: _binding_entry(SID)}
+        _seed_session(SID, lease_until=time.time() + 300)  # current, BUSY
+        other = "20261007_000000_abcdef12"
+        _seed_session(other)
+        query = self._tap(f"tgp:pb:sesss:{other}")
+        self.assertIn("Идёт ход", query.edits[0][0])
+        self.assertEqual(_STATE_DATA["topic_bindings"][KEY]["session_id"], other)
+        self.assertEqual(self.adapter.events, [])  # no /resume while busy
+
     def test_sesss_pick_unknown_session(self):
         _STATE_DATA["topic_bindings"] = {KEY: _binding_entry(None)}
         _seed_session(SID)
