@@ -532,8 +532,10 @@ async def _on_pre_gateway_dispatch_sync(event, gateway, session_store=None, **kw
             return {"action": "skip", "reason": "tg_menu"}
 
         binding = _binding_at(chat_id, tid)
-        if not binding or not str(binding.get("cwd") or "").strip():
-            # No project bound at all → the classic "choose a project" reply.
+        if binding is None:
+            # No binding at all → the classic "choose a project" reply. A
+            # binding with an empty cwd is the "no project" chat mode: the
+            # text flows to the chat's plain default session, no nag.
             key = f"{chat_id}:{tid}"
             now = time.time()
             if now - _SYNC_WARNED.get(key, 0.0) >= _SYNC_WARN_EVERY_S:
@@ -555,9 +557,7 @@ async def _on_pre_gateway_dispatch_sync(event, gateway, session_store=None, **kw
             if latest_id:
                 _update_binding_session_at(chat_id, tid, latest_id)
                 bound_sid = latest_id
-                info = _session_info_text(latest_id)
-                if info:
-                    await _send_sync_notice(chat_id, tid, info)
+                await _send_session_info(chat_id, tid, latest_id)
             else:
                 return None
 
@@ -1174,7 +1174,7 @@ def _prune_stale_state(max_age_days: int = 7) -> int:
         with _CWD_LOCK:
             state = _load_state()
             changed = False
-            for key in ("topic_bindings", "topic_panels"):
+            for key in ("topic_bindings", "topic_panels", "topic_info"):
                 bucket = state.get(key)
                 if not isinstance(bucket, dict) or not bucket:
                     continue
@@ -2589,9 +2589,34 @@ def _telegram_wire(native: Any, adapter: Any) -> None:
     except RuntimeError:
         _WIRE_LOOP = None  # factory ran off-loop; sync sends degrade to log
     try:
-        from telegram.ext import CallbackQueryHandler
+        from telegram.ext import CallbackQueryHandler, MessageHandler, filters
         native.add_handler(CallbackQueryHandler(_tg_on_button, pattern=r"^tgp:"))
         logger.info("tg-projects: telegram callback handler wired (pattern ^tgp:)")
+
+        # /menu is consumed at the ADAPTER level: core's busy path does not run
+        # pre_gateway_dispatch hooks, so a mid-turn /menu used to interrupt the
+        # agent and leak into its chat. Group -1 runs before core's handlers;
+        # ApplicationHandlerStop stops every later group. Non-/menu texts (and
+        # strangers) fall through untouched.
+        async def _menu_guard(update: Any, context: Any) -> None:
+            msg = getattr(update, "message", None) or getattr(update, "edited_message", None)
+            text = str(getattr(msg, "text", "") or "").strip()
+            if not text or text.split(" ", 1)[0] != "/menu":
+                return
+            chat = getattr(msg, "chat", None)
+            chat_id = str(getattr(chat, "id", "") or "").strip()
+            if chat_id != _OWNER_CHAT_ID:
+                return
+            thread = _norm_thread_id(getattr(msg, "message_thread_id", None))
+            _prune_stale_state()
+            _migrate_flat_bindings()
+            _wizard_reset_chat(chat_id)
+            await _pb_create(chat_id, thread)
+            from telegram.ext import ApplicationHandlerStop
+            raise ApplicationHandlerStop
+
+        native.add_handler(MessageHandler(filters.TEXT, _menu_guard), group=-1)
+        logger.info("tg-projects: /menu adapter guard wired (group -1)")
         _start_pc_reply_mirror(native)
         _push_owner_command_menu(native)
     except Exception:
@@ -2776,12 +2801,16 @@ def _pb_panel_text(binding: Optional[Dict[str, Any]], status: str = "") -> str:
     """The pinned panel body: project / live session digest / cwd."""
     if not binding:
         return "📁  —\n🧵  —\n📂  —\n\nСначала выбери проект: [📁 Проект]"
+    project_name = str(binding.get("project_name") or "").strip()
+    cwd = str(binding.get("cwd") or "").strip()
+    if not project_name and not cwd:
+        return "💬  Разговорник (без проекта)\n🧵  —\n📂  —"
     session_id = str(binding.get("session_id") or "").strip()
     session_line = _pb_panel_session_line(session_id, status) if session_id else "—"
     return (
-        f"📁  {binding.get('project_name') or '—'}\n"
+        f"📁  {project_name or '—'}\n"
         f"🧵  {session_line}\n"
-        f"📂  {binding.get('cwd') or '—'}"
+        f"📂  {cwd or '—'}"
     )
 
 
@@ -2908,14 +2937,9 @@ async def _pb_render(query, chat_id: str, thread_id: Optional[int]) -> None:
                                       reply_markup=_pb_panel_keyboard())
 
 
-def _pb_projects_text(projects: list) -> str:
-    if not projects:
-        return "📁 Проектов пока нет — создайте: /pproject <название> <абсолютный путь>"
-    return "📁 Выбор проекта (закрепит его за этим топиком):"
-
-
 async def _pb_project_screen(query, chat_id: str, thread_id: Optional[int]) -> None:
-    """[📁 Проект]: the project list — one tgp:pb:projp:<i> button per project."""
+    """[📁 Проект]: the project picker — one tgp:pb:projp:<i> button per project,
+    plus the wizard (new project) and the project-less "just chatting" mode."""
     try:
         projects = _list_projects()
     except Exception as exc:
@@ -2927,10 +2951,21 @@ async def _pb_project_screen(query, chat_id: str, thread_id: Optional[int]) -> N
     rows = [[InlineKeyboardButton(f"📁 {p.name} [{p.slug}]",
                                   callback_data=f"{_PB_CB_PREFIX}projp:{i}")]
             for i, p in enumerate(projects, 1)]
+    rows.append([InlineKeyboardButton("➕ Новый проект", callback_data="tgp:pw:start")])
+    rows.append([InlineKeyboardButton("💬 Без проекта (разговорник)",
+                                      callback_data=f"{_PB_CB_PREFIX}chat")])
     rows.append([InlineKeyboardButton("⬅️ Назад", callback_data=f"{_PB_CB_PREFIX}back")])
+    text = "📁 Выбор проекта (закрепит его за чатом):" if projects \
+        else "📁 Проектов пока нет — создайте или работайте без проекта:"
     with _suppress(Exception):
-        await query.edit_message_text(_pb_projects_text(projects),
-                                      reply_markup=InlineKeyboardMarkup(rows))
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(rows))
+
+
+async def _pb_chat_mode(query, chat_id: str, thread_id: Optional[int]) -> None:
+    """[💬 Без проекта]: an empty binding — free text goes to the chat's plain
+    default session (no project cwd pin, no nag, no auto-adopt)."""
+    _pb_write_binding(chat_id, thread_id, None, None, None, None)
+    await _pb_render(query, chat_id, thread_id)
 
 
 async def _pb_pick_project(query, chat_id: str, thread_id: Optional[int],
@@ -2960,19 +2995,11 @@ async def _pb_pick_project(query, chat_id: str, thread_id: Optional[int],
                       getattr(project, "name", None), cwd, None)
     # Default pick: the project's LATEST session becomes the chat's active
     # session immediately (the "choose project, just talk" flow), with the
-    # enter-summary so the user always knows WHERE the text lands.
+    # enter-summary (the chat's reusable info message).
     latest_id = _latest_session_id_for_cwd(cwd)
     if latest_id:
         _pb_write_binding_session(chat_id, thread_id, latest_id)
-        info = _session_info_text(latest_id)
-        bot = getattr(_NATIVE, "bot", None) if _NATIVE is not None else None
-        if info and bot is not None:
-            kwargs: Dict[str, Any] = {"chat_id": chat_id, "text": info}
-            tid = _norm_thread_id(thread_id)
-            if tid:
-                kwargs["message_thread_id"] = tid
-            with _suppress(Exception):
-                await bot.send_message(**kwargs)
+        await _send_session_info(chat_id, thread_id, latest_id)
     await _pb_render(query, chat_id, thread_id)
 
 
@@ -3064,6 +3091,45 @@ def _session_info_text(session_id: str) -> str:
     return "\n".join(lines)
 
 
+async def _send_session_info(chat_id: str, thread_id: Optional[int],
+                             session_id: str) -> None:
+    """Show the enter-summary in ONE reusable message per chat (edited in
+    place), not a new message per switch — state.json["topic_info"]."""
+    text = _session_info_text(session_id)
+    if not text:
+        return
+    bot = getattr(_NATIVE, "bot", None) if _NATIVE is not None else None
+    if bot is None or not str(chat_id or "").strip():
+        return
+    key = _pb_panel_key(chat_id, thread_id)
+    try:
+        mid = (_load_state().get("topic_info") or {}).get(key)
+    except Exception:
+        mid = None
+    if mid:
+        try:
+            await bot.edit_message_text(chat_id=int(chat_id), message_id=int(mid), text=text)
+            return
+        except Exception:
+            pass  # message deleted/lost — fall through and send a fresh one
+    kwargs: Dict[str, Any] = {"chat_id": chat_id, "text": text}
+    tid = _norm_thread_id(thread_id)
+    if tid:
+        kwargs["message_thread_id"] = tid
+    try:
+        message = await bot.send_message(**kwargs)
+    except Exception:
+        logger.warning("tg-projects: session info send failed", exc_info=True)
+        return
+    message_id = getattr(message, "message_id", None)
+    if not message_id:
+        return
+    with _CWD_LOCK:
+        state = _load_state()
+        state.setdefault("topic_info", {})[key] = int(message_id)
+        _save_state(state)
+
+
 async def _pb_pick_session(query, chat_id: str, thread_id: Optional[int],
                            session_id: str) -> None:
     """A tgp:pb:sesss:<id> tap: bind the session, resume it, re-render the panel."""
@@ -3084,17 +3150,10 @@ async def _pb_pick_session(query, chat_id: str, thread_id: Optional[int],
         return
     _pb_write_binding_session(chat_id, thread_id, session_id)
     await _do_resume_by_id(query, session_id)
-    # The enter-summary rides its own message: _pb_render re-renders the panel
-    # in place right after, so a summary edited into the panel would vanish.
-    info = _session_info_text(session_id)
-    bot = getattr(_NATIVE, "bot", None) if _NATIVE is not None else None
-    if info and bot is not None:
-        kwargs: Dict[str, Any] = {"chat_id": chat_id, "text": info}
-        tid = _norm_thread_id(thread_id)
-        if tid:
-            kwargs["message_thread_id"] = tid
-        with _suppress(Exception):
-            await bot.send_message(**kwargs)
+    # The enter-summary edits the chat's reusable info message: the panel edit
+    # is re-rendered in place right after, so a summary edited into the panel
+    # would vanish — and one NEW message per switch used to spam the chat.
+    await _send_session_info(chat_id, thread_id, session_id)
     await _pb_render(query, chat_id, thread_id)
 
 
@@ -3176,6 +3235,8 @@ async def _handle_panel_callback(query, data: str) -> None:
             await _pb_sessions_screen(query, chat_id, thread_id)
         elif rest == "new":
             await _pb_new_session(query, chat_id, thread_id)
+        elif rest == "chat":
+            await _pb_chat_mode(query, chat_id, thread_id)
         elif rest == "stop":
             await _pb_stop(query)
         elif rest == "more":
