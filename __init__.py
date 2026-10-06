@@ -3148,8 +3148,12 @@ async def _pb_pick_session(query, chat_id: str, thread_id: Optional[int],
                 f"❌ Сессия {session_id} не найдена — обновите список: [🧵 Сессия].",
                 reply_markup=_pb_back_keyboard())
         return
+    # Tapping the ALREADY-active session must not inject a /resume — the core
+    # would reply "already in session" noise on every pointless re-tap.
+    prev_sid = str((_pb_binding(chat_id, thread_id) or {}).get("session_id") or "").strip()
     _pb_write_binding_session(chat_id, thread_id, session_id)
-    await _do_resume_by_id(query, session_id)
+    if prev_sid != session_id:
+        await _do_resume_by_id(query, session_id)
     # The enter-summary edits the chat's reusable info message: the panel edit
     # is re-rendered in place right after, so a summary edited into the panel
     # would vanish — and one NEW message per switch used to spam the chat.
