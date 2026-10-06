@@ -725,10 +725,25 @@ async def _pc_reply_mirror_loop(native: Any) -> None:
                 conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=5.0)
                 conn.row_factory = sqlite3.Row
                 for sid in bindings:
+                    if sid not in _PC_MIRROR_SEEN:
+                        # Bootstrap: never replay history — adopt the CURRENT
+                        # tail (max message id) as already seen. Fetching a
+                        # limited page instead left older pages "unseen" and
+                        # the mirror replayed them 20 rows per cycle.
+                        try:
+                            row = conn.execute(
+                                "SELECT COALESCE(MAX(id), 0) FROM messages WHERE session_id = ?",
+                                (sid,),
+                            ).fetchone()
+                            _PC_MIRROR_SEEN[sid] = int(row[0]) if row is not None else 0
+                        except Exception:
+                            _PC_MIRROR_SEEN[sid] = 0
+                        continue
                     since = _PC_MIRROR_SEEN.get(sid, 0)
                     rows = conn.execute(
-                        "SELECT id, content, timestamp FROM messages "
+                        "SELECT id, content, timestamp, display_kind FROM messages "
                         "WHERE session_id = ? AND role = 'assistant' AND id > ? "
+                        "AND (display_kind IS NULL OR display_kind = '') "
                         "ORDER BY id LIMIT 20",
                         (sid, since),
                     ).fetchall()
@@ -741,11 +756,6 @@ async def _pc_reply_mirror_loop(native: Any) -> None:
                     with _suppress(Exception):
                         conn.close()
             for sid, rows in rows_by_sid.items():
-                if sid not in _PC_MIRROR_SEEN:
-                    # Bootstrap: never replay history on (re)start — adopt
-                    # the current tail as "already seen".
-                    _PC_MIRROR_SEEN[sid] = int(rows[-1]["id"])
-                    continue
                 until = _pc_mirror_lease_tg_until(sid)
                 if until is not None:
                     _PC_MIRROR_TG_UNTIL[sid] = until
@@ -758,6 +768,8 @@ async def _pc_reply_mirror_loop(native: Any) -> None:
                     content = str(row["content"] or "").strip()
                     if not content:
                         continue
+                    if content.startswith(("<invoke", "<tool", "{\"output")):
+                        continue  # raw tool-call markup — not a chat reply
                     kwargs: Dict[str, Any] = {
                         "chat_id": chat_id, "text": "🖥️ " + content[:3500]}
                     if tid.isdigit():
@@ -1898,8 +1910,19 @@ def _callers_admin(source) -> bool:
         from gateway.slash_access import policy_for_runner_source
         policy = policy_for_runner_source(runner, source)
         uid = getattr(source, "user_id", None)
-        return bool(policy.is_admin(uid))
+        result = bool(policy.is_admin(uid))
+        try:
+            logger.info(
+                "tg-projects: admin check uid=%r platform=%r chat_type=%r -> "
+                "enabled=%s admins=%s result=%s",
+                uid, getattr(getattr(source, "platform", None), "value", None),
+                getattr(source, "chat_type", None), getattr(policy, "enabled", "?"),
+                sorted(getattr(policy, "admin_user_ids", ()) or ()), result)
+        except Exception:
+            logger.info("tg-projects: admin check uid=%r -> result=%s", uid, result)
+        return result
     except Exception:
+        logger.warning("tg-projects: admin check failed", exc_info=True)
         return False
 
 
@@ -2149,6 +2172,8 @@ async def _do_resume_by_id(query, session_id: str) -> None:
     else:
         cmd = f"/resume {session_id}"
         suffix = " (если сессия из другого источника — см. примечание)"
+    logger.info("tg-projects: resume dispatch session=%s cross_origin=%s admin=%s cmd=%r",
+                session_id, cross_origin, admin, cmd)
 
     lines = [
         f"▶️ Продолжаю сессию {session_id} ({_fmt_ts(row['started_at'])}) — {row['message_count']} msg",
@@ -2447,7 +2472,16 @@ async def _do_resume(query, project, index_str: str, state_conn) -> None:
     except Exception:
         pass
 
-    await _send_gateway_command(query, f"/resume {target['id']}")
+    # Cross-origin (desktop) targets need the admin --all form, exactly like
+    # _do_resume_by_id — a plain /resume hits the gateway's IDOR guard.
+    cross_origin = not _session_is_same_source(
+        state_conn, target["id"], target.get("source", ""), _adapter_source_for(query))
+    admin = _callers_admin(_adapter_source_for(query))
+    resume_cmd = (f"/resume --all {target['id']}" if cross_origin and admin
+                  else f"/resume {target['id']}")
+    logger.info("tg-projects: resume dispatch session=%s cross_origin=%s admin=%s cmd=%r",
+                target["id"], cross_origin, admin, resume_cmd)
+    await _send_gateway_command(query, resume_cmd)
 
 
 async def _edit_project_list(query, projects: list, offset: int = 0) -> None:
