@@ -191,7 +191,8 @@ class _FakeStateDBSchema:
             "CREATE TABLE sessions (id TEXT PRIMARY KEY, source TEXT, cwd TEXT,"
             " started_at REAL, message_count INTEGER, title TEXT, chat_id TEXT,"
             " thread_id TEXT, ended_at REAL, model TEXT,"
-            " input_tokens INTEGER DEFAULT 0, output_tokens INTEGER DEFAULT 0)")
+            " input_tokens INTEGER DEFAULT 0, output_tokens INTEGER DEFAULT 0,"
+            " last_activity_at REAL)")
         self.conn.execute(
             "CREATE TABLE messages (session_id TEXT, role TEXT, content TEXT)")
         self.conn.execute(
@@ -385,16 +386,19 @@ def _run(coro):
 
 
 def _seed_session(sid, source="telegram", cwd=CWD, started=1791300000.0,
-                  count=12, chat=CHAT, thread=str(THREAD), lease_until=None):
+                  count=12, chat=CHAT, thread=str(THREAD), lease_until=None,
+                  ended=None, last_active=None):
     conn = _FAKE_STATE.conn
     conn.execute(
         "INSERT INTO sessions (id, source, cwd, started_at, message_count,"
-        " title, chat_id, thread_id) VALUES (?,?,?,?,?,?,?,?)",
-        (sid, source, cwd, started, count, "", chat, thread))
+        " title, chat_id, thread_id, ended_at, last_activity_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
+        (sid, source, cwd, started, count, "", chat, thread, ended,
+         last_active if last_active is not None else
+         (time.time() if ended is None else (ended or started))))
     if lease_until is not None:
         conn.execute(
             "INSERT INTO session_turn_leases (conversation_id, holder,"
-            " acquired_at, expires_at) VALUES (?,?,?,?)",
+             " acquired_at, expires_at) VALUES (?,?,?,?)",
             (sid, "pid=42:turn=d", time.time(), lease_until))
     conn.commit()
 
@@ -431,6 +435,31 @@ class PanelStateTests(_StubbedTestCase):
 
 
 @unittest.skipUnless(_HAS_PANEL, "deploy copy has no panel code yet")
+class SessionsRecencyTests(_StubbedTestCase):
+    """Live sessions plus recently-active ended ones (a /new reset must not
+    hide today's sessions); anything a day old is history."""
+
+    def setUp(self):
+        super().setUp()
+        _reset_state()
+        _reset_fake_db()
+
+    def test_recent_ended_session_still_listed(self):
+        _seed_session("20261006_230317_dae58d9c", count=5, ended=time.time() - 60)
+        sessions = mod._sessions_for_cwd(_FAKE_STATE.conn, CWD, limit=10)
+        self.assertEqual([s["id"] for s in sessions], ["20261006_230317_dae58d9c"])
+
+    def test_stale_ended_session_hidden(self):
+        _seed_session("20260924_202644_c78def", count=109,
+                      ended=time.time() - 90000, last_active=time.time() - 90000)
+        self.assertEqual(mod._sessions_for_cwd(_FAKE_STATE.conn, CWD, limit=10), [])
+
+    def test_live_session_always_listed(self):
+        _seed_session(SID, started=time.time() - 400000)
+        sessions = mod._sessions_for_cwd(_FAKE_STATE.conn, CWD, limit=10)
+        self.assertEqual([s["id"] for s in sessions], [SID])
+
+
 class PanelTextTests(_StubbedTestCase):
     """The 4 panel renders."""
 

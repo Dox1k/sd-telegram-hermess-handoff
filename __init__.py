@@ -1237,9 +1237,14 @@ def _sessions_for_cwd(state_conn, cwd: str, limit: int = 2, source: Optional[str
     """
     rows = []
     try:
+        # Live sessions, plus recently-active ended ones (a /new reset ends the
+        # lane session but it stays open as a desktop tab and pickable for ~a
+        # day); anything older than that is history the user does not want.
+        cutoff = time.time() - 86400.0
         sql = ("SELECT id, title, source, started_at, message_count FROM sessions "
-               "WHERE cwd = ? AND message_count > 0 AND ended_at IS NULL")
-        args: list = [cwd]
+               "WHERE cwd = ? AND message_count > 0"
+               " AND (ended_at IS NULL OR COALESCE(last_activity_at, started_at) > ?)")
+        args: list = [cwd, cutoff]
         if source:
             sql += " AND source = ?"
             args.append(source)
