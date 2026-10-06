@@ -839,7 +839,13 @@ def _start_pc_reply_mirror(native: Any) -> None:
 
 
 # The chat-whitelisted owner: the only chat the command menu is scoped to.
-_OWNER_CHAT_ID = "7559860199"
+_OWNER_CHAT_ID = os.environ.get("TGP_OWNER_CHAT", "").strip() or "7559860199"
+
+
+def _owner_chat_id() -> str:
+    """The chat-whitelisted owner: env TGP_OWNER_CHAT (set for another user's
+    install), falling back to this deployment's original owner."""
+    return os.environ.get("TGP_OWNER_CHAT", "").strip() or _OWNER_CHAT_ID
 
 
 def _push_owner_command_menu(native: Any) -> None:
@@ -3331,7 +3337,8 @@ _APPROVALS_KEY = "approvals_map"
 _APPROVAL_CB_RE = re.compile(
     r"^tgp:a:(once|session|always|deny):([a-f0-9]{32}):([a-f0-9]{8})$")
 # The chat-whitelisted owner's DM: the always-available presentation target.
-_APPROVAL_FALLBACK_CHAT = "7559860199"
+# The chat-whitelisted owner's DM: the always-available presentation target.
+_APPROVAL_FALLBACK_CHAT = _owner_chat_id()
 # Hard cap on one presentation wait (the host default is 300s anyway).
 _APPROVAL_MAX_WAIT_S = 300.0
 # request_id -> {"event", "request", "choice"}: in-memory waiters the
@@ -3426,7 +3433,7 @@ def _approval_target() -> tuple:
         topic = _approval_any_bound_topic()
     if topic is not None:
         return topic
-    return (_APPROVAL_FALLBACK_CHAT, None)
+    return (_owner_chat_id(), None)
 
 
 def _tg_send_sync(kwargs: Dict[str, Any], wait_s: float) -> Any:
