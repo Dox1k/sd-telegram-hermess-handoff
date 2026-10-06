@@ -505,9 +505,10 @@ class PanelBindingTests(_StubbedTestCase):
         self.assertIsNone(entry["session_id"])
         self.assertIn("updated_at", entry)
 
-    def test_write_binding_needs_thread(self):
-        self.assertFalse(mod._pb_write_binding(CHAT, None, "p1", "x", "/p", None))
-        self.assertNotIn("topic_bindings", _STATE_DATA)
+    def test_write_binding_flat_chat_lands_on_key_zero(self):
+        # Topics off: thread None targets the chat's flat lane (<chat>:0).
+        self.assertTrue(mod._pb_write_binding(CHAT, None, "p1", "x", "/p", None))
+        self.assertEqual(_STATE_DATA["topic_bindings"][f"{CHAT}:0"]["project_id"], "p1")
 
     def test_write_binding_session_roundtrip(self):
         _STATE_DATA["topic_bindings"] = {KEY: _binding_entry(None)}

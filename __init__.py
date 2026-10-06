@@ -395,10 +395,13 @@ def _binding_at(chat_id: Any, thread_id: Any) -> Optional[Dict[str, Any]]:
 
     pre_gateway_dispatch runs BEFORE the dispatch layer binds the session
     env (gateway/run_inbound.py:270), so the key is built from the event's
-    source, never from HERMES_SESSION_*.
+    source, never from HERMES_SESSION_*. A topic-less DM (topics disabled)
+    normalizes to thread 0 — the chat's single flat lane.
     """
     tid = _norm_thread_id(thread_id)
-    if tid is None or not str(chat_id or "").strip():
+    if tid is None:
+        tid = 0
+    if not str(chat_id or "").strip():
         return None
     key = f"{chat_id}:{tid}"
     try:
@@ -417,7 +420,9 @@ def _update_binding_session_at(chat_id: Any, thread_id: Any,
     contexts, which carry no session env (see _session_key_from_query).
     """
     tid = _norm_thread_id(thread_id)
-    if tid is None or not str(chat_id or "").strip():
+    if tid is None:
+        tid = 0  # topic-less DM: the chat's flat lane
+    if not str(chat_id or "").strip():
         return
     key = f"{chat_id}:{tid}"
     clean = str(session_id).strip() if session_id is not None else ""
@@ -507,8 +512,10 @@ async def _on_pre_gateway_dispatch_sync(event, gateway, session_store=None, **kw
             return None  # bindings are DM-topic keyed
         chat_id = str(getattr(source, "chat_id", "") or "").strip()
         tid = _norm_thread_id(getattr(source, "thread_id", None))
-        if not chat_id or tid is None:
-            return None  # plain DM lane (no topic) — nothing to sync
+        if not chat_id:
+            return None
+        if tid is None:
+            tid = 0  # topic-less DM (topics off): the chat's single flat lane
 
         binding = _binding_at(chat_id, tid)
         bound_sid = str((binding or {}).get("session_id") or "").strip()
@@ -562,6 +569,55 @@ async def _on_pre_gateway_dispatch_sync(event, gateway, session_store=None, **kw
         return None
 
 
+def _migrate_flat_bindings() -> int:
+    """Carry each chat's newest topic binding over to the flat key ``<chat>:0``.
+
+    Topics were switched off: the chat's only lane is the topic-less one, but
+    the bindings live under ``<chat>:<old_thread>``. The newest binding per
+    chat (by updated_at) is copied — not moved, the stale topic keys age out
+    via _prune_stale_state. Idempotent: a chat that already has a ``:0`` key
+    is never touched.
+    """
+    migrated = 0
+    try:
+        with _CWD_LOCK:
+            state = _load_state()
+            bindings = state.get("topic_bindings")
+            if not isinstance(bindings, dict) or not bindings:
+                return 0
+            by_chat: Dict[str, tuple] = {}
+            for key, entry in bindings.items():
+                if not isinstance(entry, dict):
+                    continue
+                chat_s, _, thread_s = str(key).rpartition(":")
+                if not chat_s or not str(thread_s).isdigit() or int(thread_s) == 0:
+                    continue  # flat keys themselves / malformed rows
+                rank = (int(entry.get("updated_at") or 0), str(key))
+                if chat_s not in by_chat or rank > by_chat[chat_s]:
+                    by_chat[chat_s] = rank
+            for chat_s, (_, best_key) in by_chat.items():
+                flat_key = f"{chat_s}:0"
+                if flat_key in bindings:
+                    continue
+                entry = dict(bindings[best_key])
+                # The carried-over session id belonged to the retired topic
+                # lane; the flat lane starts unbound so the user picks a
+                # session explicitly (a stale id would silently steer the
+                # lane onto an unrelated conversation).
+                entry["session_id"] = None
+                entry["updated_at"] = int(time.time())
+                bindings[flat_key] = entry
+                migrated += 1
+            if migrated:
+                _save_state(state)
+                logger.info("tg-projects: migrated %d topic binding(s) to flat keys",
+                            migrated)
+    except Exception:
+        logger.warning("tg-projects: flat binding migration failed", exc_info=True)
+        return 0
+    return migrated
+
+
 # ------------------------------------------------------- PC -> TG reply mirror
 # The desktop drives the same sessions through its OWN hermes serve process;
 # its replies go to the desktop UI, not the Telegram topic (delivery needs
@@ -577,13 +633,41 @@ _PC_MIRROR_TG_UNTIL: Dict[str, float] = {}  # session_id -> rows before this ts 
 _PC_MIRROR_TASK: Optional["asyncio.Task"] = None
 
 
+def _pc_mirror_root_session(conn, session_id: str) -> str:
+    """The compression-chain root id the turn lease is keyed by.
+
+    hermes_state walks parent_session_id markers to the conversation root and
+    keys session_turn_leases by THAT id (hermes_state_compression.
+    _session_turn_lease_key_on_conn); a resumed/child session's lease is never
+    under its own id, so the mirror must walk the same chain.
+    """
+    sid = str(session_id or "")
+    seen = set()
+    while sid and sid not in seen:
+        seen.add(sid)
+        try:
+            row = conn.execute(
+                "SELECT parent_session_id FROM sessions WHERE id = ?", (sid,)
+            ).fetchone()
+        except Exception:
+            return sid
+        parent = str((row["parent_session_id"] if row is not None else "") or "").strip()
+        if not parent:
+            return sid
+        sid = parent
+    return sid
+
+
 def _pc_mirror_lease_tg_until(session_id: str) -> Optional[float]:
     """Until when assistant rows for *session_id* count as TG-delivered.
 
-    A fresh lease with holder platform=telegram means this gateway runs the
-    turn and the adapter delivers the reply itself. The window is remembered
+    A live lease on the conversation root means a gateway turn owns the
+    session; the holder string embeds the routing key (owner_key = the
+    session key), and a TELEGRAM lane key contains "telegram" — those turns
+    were already delivered by the adapter. The window is remembered
     (expires_at + grace) so the final transcript flush that lands right
-    after the lease is released is not mirrored a second time.
+    after the lease is released is not mirrored a second time. A desktop
+    holder (no "telegram" in the key) never suppresses the mirror.
     """
     path = _hermes_home() / "state.db"
     if not path.exists():
@@ -592,16 +676,18 @@ def _pc_mirror_lease_tg_until(session_id: str) -> Optional[float]:
     try:
         conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=5.0)
         conn.row_factory = sqlite3.Row
-        row = conn.execute(
-            "SELECT holder, expires_at FROM session_turn_leases WHERE conversation_id = ?",
-            (session_id,),
-        ).fetchone()
-        if row is None:
+        root = _pc_mirror_root_session(conn, session_id)
+        for sid in (session_id, root):
+            row = conn.execute(
+                "SELECT holder, expires_at FROM session_turn_leases WHERE conversation_id = ?",
+                (sid,),
+            ).fetchone()
+            if row is None:
+                continue
+            holder = str(row["holder"] or "")
+            if "telegram" in holder:
+                return float(row["expires_at"] or 0.0) + _PC_MIRROR_TG_GRACE_S
             return None
-        holder = str(row["holder"] or "")
-        m = re.search(r"platform=([a-z_]+)", holder)
-        if m and m.group(1) == "telegram":
-            return float(row["expires_at"] or 0.0) + _PC_MIRROR_TG_GRACE_S
         return None
     except Exception:
         return None
@@ -1714,7 +1800,7 @@ def _sessions_keyboard(index: int, sessions: list):
     all-sessions (desktop included) view, and back to the project list."""
     from telegram import InlineKeyboardButton, InlineKeyboardMarkup
     rows = [
-        [InlineKeyboardButton(f"▶️ {str(s['id'])[:12]}… · {s.get('message_count', 0)} msg",
+        [InlineKeyboardButton(f"▶️ {str(s.get('title') or '').strip() or (str(s['id'])[:12] + '…')} · {s.get('message_count', 0)} msg",
                               callback_data=f"{CB_PREFIX}s:{s['id']}")]
         for s in sessions
     ]
@@ -1728,17 +1814,30 @@ def _sessions_keyboard(index: int, sessions: list):
 
 # ---------------------------------------------------- synthetic gateway message injection
 def _source_from_query(adapter: Any, query: Any, thread_id: Optional[Any] = None):
-    """SessionSource of a button tap: prefer the adapter's auth source builder.
+    """SessionSource of a button tap: the TAPPER's identity, not the message's.
 
-    *thread_id* (a Telegram topic id) overrides the tapped message's thread when
-    given — the "new project" flow answers in the topic that owns the project,
-    not the one where the button was pressed.
+    The keyboards are sent BY THE BOT, so ``query.message.from_user`` is the
+    bot itself — building the auth source from it made the gateway reject
+    every synthetic command (/new, /resume, /stop) with "Unauthorized user:
+    <bot_id>". The acting user is ``query.from_user`` (the human who tapped);
+    it overrides the message author on both the adapter-built and the manual
+    fallback path. *thread_id* (a Telegram topic id) overrides the tapped
+    message's thread when given — the "new project" flow answers in the topic
+    that owns the project, not the one where the button was pressed.
     """
+    tapper = getattr(query, "from_user", None)
+    tap_id = str(getattr(tapper, "id", "") or "").strip() or None
+    tap_name = (str(getattr(tapper, "username", "") or getattr(tapper, "full_name", ""))
+                or None)
     try:
         source = adapter._source_from_message_for_auth(query.message)
         if source is not None:
+            import dataclasses
+            if tap_id:
+                source = dataclasses.replace(
+                    source, user_id=tap_id, user_name=tap_name or source.user_name,
+                    is_bot=bool(getattr(tapper, "is_bot", False)))
             if thread_id is not None and str(thread_id or "") not in {"", None}:
-                import dataclasses
                 source = dataclasses.replace(source, thread_id=str(thread_id))
             return source
     except Exception:
@@ -1746,7 +1845,7 @@ def _source_from_query(adapter: Any, query: Any, thread_id: Optional[Any] = None
 
     msg = getattr(query, "message", None)
     chat = getattr(msg, "chat", None) if msg is not None else None
-    user = getattr(msg, "from_user", None) if msg is not None else None
+    user = tapper if tapper is not None else getattr(msg, "from_user", None)
     chat_id = getattr(chat, "id", None)
     chat_id = str(chat_id) if chat_id is not None else ""
     if hasattr(adapter, "_normalize_chat_type"):
@@ -2168,7 +2267,8 @@ async def _edit_all_sessions(query, projects: list, proj, index_str: str, state_
         has_desktop = any(s["source"] == "desktop" for s in sessions)
         for s in sessions:
             flag = "🖥️ " if s["source"] == "desktop" else ""
-            lines.append(f"{flag}{s['id']} ({_fmt_ts(s['started_at'])}) {s['message_count']} msg — {_trim(s['last_message'], 40) or '(пусто)'}")
+            label = str(s.get("title") or "").strip() or str(s["id"])[:12] + "…"
+            lines.append(f"{flag}• {label} ({_fmt_ts(s['started_at'])}) {s['message_count']} msg — {_trim(s['last_message'], 40) or '(пусто)'}")
         if has_desktop:
             lines.append("")
             lines.append("⚠️ 🖥️ — сессия создана в десктопе. Если она открыта и там, и на телефоне "
@@ -2226,7 +2326,7 @@ def _all_sessions_keyboard(index: int, sessions: list):
     a timestamp-based id is ~21 chars, so tgp:s:<id> stays under the cap)."""
     from telegram import InlineKeyboardButton, InlineKeyboardMarkup
     rows = [
-        [InlineKeyboardButton(f"▶️ {s['id'][:12]}… · {s.get('message_count', 0)} msg",
+        [InlineKeyboardButton(f"▶️ {str(s.get('title') or '').strip() or (s['id'][:12] + '…')} · {s.get('message_count', 0)} msg",
                               callback_data=f"{CB_PREFIX}s:{s['id']}")]
         for s in sessions
     ]
@@ -2376,7 +2476,8 @@ async def _edit_sessions(query, projects: list, proj, index_str: str, state_conn
             if s["source"] == "desktop":
                 has_desktop = True
             flag = "🖥️ " if s["source"] == "desktop" else ""
-            lines.append(f"{flag}• {s['id']} ({_fmt_ts(s['started_at'])}) {s['message_count']} msg — {_trim(s['last_message'], 60) or '(пусто)'}")
+            label = str(s.get("title") or "").strip() or str(s["id"])[:12] + "…"
+            lines.append(f"{flag}• {label} ({_fmt_ts(s['started_at'])}) {s['message_count']} msg — {_trim(s['last_message'], 60) or '(пусто)'}")
         if has_desktop:
             lines.append("")
             lines.append("⚠️ 🖥️ — сессия из десктопа; одновременная работа с двух сторон пишет историю из двух процессов.")
@@ -2510,11 +2611,14 @@ def _pb_clear_panel(chat_id: str, thread_id: Optional[int]) -> None:
 
 
 def _pb_binding(chat_id: str, thread_id: Optional[int]) -> Optional[Dict[str, Any]]:
-    """The topic's topic_bindings entry, read by an explicit key (a copy)."""
-    if thread_id is None:
-        return None
+    """The topic's topic_bindings entry, read by an explicit key (a copy).
+
+    ``thread_id=None`` (topics disabled — the chat's flat lane) normalizes
+    to key ``<chat>:0``.
+    """
+    tid = 0 if thread_id is None else int(thread_id)
     try:
-        entry = (_load_state().get("topic_bindings") or {}).get(f"{chat_id}:{thread_id}")
+        entry = (_load_state().get("topic_bindings") or {}).get(f"{chat_id}:{tid}")
     except Exception:
         return None
     return dict(entry) if isinstance(entry, dict) else None
@@ -2523,10 +2627,10 @@ def _pb_binding(chat_id: str, thread_id: Optional[int]) -> Optional[Dict[str, An
 def _pb_write_binding(chat_id: str, thread_id: Optional[int], project_id: Any,
                       project_name: Any, cwd: Any, session_id: Any = None) -> bool:
     """Create/refresh the binding at an explicit key; the session resets to None
-    (the [📁 Проект] pick semantics: _set_topic_binding + _update_binding_session(None))."""
-    if thread_id is None:
-        return False
-    key = f"{chat_id}:{thread_id}"
+    (the [📁 Проект] pick semantics: _set_topic_binding + _update_binding_session(None)).
+    ``thread_id=None`` writes the flat-lane key ``<chat>:0``."""
+    tid = 0 if thread_id is None else int(thread_id)
+    key = f"{chat_id}:{tid}"
     clean = str(session_id).strip() if session_id is not None else ""
     with _CWD_LOCK:
         state = _load_state()
@@ -2544,10 +2648,10 @@ def _pb_write_binding(chat_id: str, thread_id: Optional[int], project_id: Any,
 
 def _pb_write_binding_session(chat_id: str, thread_id: Optional[int],
                               session_id: Optional[str]) -> bool:
-    """Record the topic's working session at an explicit key (None resets)."""
-    if thread_id is None:
-        return False
-    key = f"{chat_id}:{thread_id}"
+    """Record the topic's working session at an explicit key (None resets).
+    ``thread_id=None`` targets the flat-lane key ``<chat>:0``."""
+    tid = 0 if thread_id is None else int(thread_id)
+    key = f"{chat_id}:{tid}"
     with _CWD_LOCK:
         state = _load_state()
         bindings = state.get("topic_bindings") or {}
@@ -2575,12 +2679,37 @@ def _pb_short_session_id(session_id: str) -> str:
     return text[:12] + "…" if len(text) > 12 else text
 
 
+def _pb_session_label(s: Dict[str, Any]) -> str:
+    """A short session label for buttons/lines: the Hermes title, id fallback."""
+    title = str(s.get("title") or "").strip()
+    sid = str(s.get("id") or "").strip()
+    if title and title != "(без названия)":
+        return _trim(title, 28)
+    return (_pb_short_session_id(sid) if sid else "—")
+
+
 def _pb_panel_text(binding: Optional[Dict[str, Any]], status: str = "") -> str:
     """The pinned panel body: project / session / cwd."""
     if not binding:
         return "📁  —\n🧵  —\n📂  —\n\nСначала выбери проект: [📁 Проект]"
     session_id = str(binding.get("session_id") or "").strip()
     session_line = f"{_pb_short_session_id(session_id)} · {status or 'idle'}" if session_id else "—"
+    if session_id:
+        # Prefer the session's Hermes title (state.db sessions.title) over the raw id.
+        try:
+            state_conn = _sessions_state_conn()
+            try:
+                row = state_conn.execute(
+                    "SELECT title FROM sessions WHERE id = ?", (session_id,)
+                ).fetchone()
+                title = str((row["title"] if row is not None else "") or "").strip()
+            finally:
+                with _suppress(Exception):
+                    state_conn.close()
+            if title and title != "(без названия)":
+                session_line = f"{_trim(title, 28)} · {status or 'idle'}"
+        except Exception:
+            pass
     return (
         f"📁  {binding.get('project_name') or '—'}\n"
         f"🧵  {session_line}\n"
@@ -2646,8 +2775,17 @@ async def _pb_create(chat_id: str, thread_id: Optional[int]) -> bool:
     try:
         message = await bot.send_message(**kwargs)
     except Exception:
-        logger.warning("tg-projects: panel send failed", exc_info=True)
-        return False
+        # A chat with topics disabled rejects a stale message_thread_id —
+        # retry flat once before giving up.
+        if "message_thread_id" not in kwargs:
+            logger.warning("tg-projects: panel send failed", exc_info=True)
+            return False
+        kwargs.pop("message_thread_id", None)
+        try:
+            message = await bot.send_message(**kwargs)
+        except Exception:
+            logger.warning("tg-projects: panel send failed", exc_info=True)
+            return False
     message_id = getattr(message, "message_id", None)
     if not message_id:
         return False
@@ -2731,13 +2869,8 @@ async def _pb_project_screen(query, chat_id: str, thread_id: Optional[int]) -> N
 
 async def _pb_pick_project(query, chat_id: str, thread_id: Optional[int],
                            index_str: str) -> None:
-    """A tgp:pb:projp:<i> tap: bind the topic to the project, reset the session."""
-    if thread_id is None:
-        with _suppress(Exception):
-            await query.edit_message_text(
-                "Привязка работает в топике форума — откройте /menu в топике проекта.",
-                reply_markup=_pb_back_keyboard())
-        return
+    """A tgp:pb:projp:<i> tap: bind the topic (or the flat chat lane) to the
+    project, reset the session."""
     try:
         projects = _list_projects()
     except Exception as exc:
@@ -2772,7 +2905,7 @@ def _pb_sessions_text(binding: Optional[Dict[str, Any]], sessions: list) -> str:
     else:
         for s in sessions:
             flag = "🖥️ " if s.get("source") == "desktop" else ""
-            lines.append(f"{flag}• {_pb_short_session_id(s['id'])} · "
+            lines.append(f"{flag}• {_pb_session_label(s)} · "
                          f"{s.get('status') or 'idle'} · {s.get('message_count', 0)} msg")
     return "\n".join(lines)
 
@@ -2792,7 +2925,7 @@ async def _pb_sessions_screen(query, chat_id: str, thread_id: Optional[int]) -> 
     from telegram import InlineKeyboardButton, InlineKeyboardMarkup
     rows = [[InlineKeyboardButton(
                  f"▶️ {('🖥️ ' if s.get('source') == 'desktop' else '')}"
-                 f"{_pb_short_session_id(s['id'])} · {s.get('status') or 'idle'}",
+                 f"{_pb_session_label(s)} · {s.get('status') or 'idle'}",
                  callback_data=f"{_PB_CB_PREFIX}sesss:{s['id']}")]
             for s in sessions]
     rows.append([InlineKeyboardButton("⬅️ Назад", callback_data=f"{_PB_CB_PREFIX}back")])
@@ -2804,12 +2937,6 @@ async def _pb_sessions_screen(query, chat_id: str, thread_id: Optional[int]) -> 
 async def _pb_pick_session(query, chat_id: str, thread_id: Optional[int],
                            session_id: str) -> None:
     """A tgp:pb:sesss:<id> tap: bind the session, resume it, re-render the panel."""
-    if thread_id is None:
-        with _suppress(Exception):
-            await query.edit_message_text(
-                "Сессии привязываются в топике форума — /menu в топике проекта.",
-                reply_markup=_pb_back_keyboard())
-        return
     state_conn = _sessions_state_conn()
     try:
         with _suppress(Exception):
@@ -2968,6 +3095,7 @@ async def _menu_command(raw_args: str) -> Optional[str]:
     if (raw_args or "").strip():
         return "Использование: /menu — без аргументов."
     _prune_stale_state()  # drop bindings/panels untouched for 7 days
+    _migrate_flat_bindings()  # topics off: carry the newest binding to <chat>:0
     _wizard_reset_chat(str(_session_env("HERMES_SESSION_CHAT_ID", "") or "").strip())
     chat_id = str(_session_env("HERMES_SESSION_CHAT_ID", "") or "").strip()
     thread_id = _norm_thread_id(_current_thread_id())
@@ -3740,6 +3868,11 @@ def register(ctx) -> None:
         _prune_stale_state()
     except Exception:
         logger.warning("tg-projects: startup state prune failed", exc_info=True)
+    # Topics off: migrate each chat's newest topic binding to the flat key.
+    try:
+        _migrate_flat_bindings()
+    except Exception:
+        logger.warning("tg-projects: flat binding migration failed", exc_info=True)
     # Project wizard (/menu → [➕ Новый]): consumes free-text answers via
     # pre_gateway_dispatch BEFORE the text reaches the session. Registered
     # BEFORE the sync hook so a live wizard owns the lane's free text;
