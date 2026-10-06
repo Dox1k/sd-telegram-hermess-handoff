@@ -36,7 +36,6 @@ Inline buttons (callback_data, all <= 64 bytes; project ids are 1-based indices
   into the /projects listing, stable within one chat; the "back" button is a
   fixed string with no id; <id> is a state.db session id)
   tgp:p:<i>     open project <i> menu
-  tgp:m:<i>     project <i> menu (from the project button)
   tgp:n:<i>     new session in project <i>   (= /pnew <i> + /new)
   tgp:r:<i>     continue the last session of project <i>
   tgp:a:<i>     all sessions of project <i> (desktop + telegram)
@@ -378,6 +377,330 @@ def _notify_unbound_topic(session_id: str) -> None:
                        exc_info=True)
 
 
+# --------------------------------------------------------------- seamless sync
+# One forum topic = one project + one active session. Free text from a bound
+# topic must land in the SAME sessions.id the desktop works on (state.db is
+# the shared truth; the desktop drives its own hermes serve process).
+# The core already heals ITS telegram_dm_topic_bindings row
+# (gateway/run_turn.py _hmwa_heal_telegram_topic_binding: read binding by
+# (chat_id, thread_id), walk the compression tip, switch_session on drift).
+# This hook mirrors that guarantee for the plugin's state.json binding and
+# answers unbound topics. It NEVER blocks a bound topic's message.
+_SYNC_WARN_EVERY_S = 60.0  # rate-limit for the "choose a project" reply
+_SYNC_WARNED: Dict[str, float] = {}
+
+
+def _binding_at(chat_id: Any, thread_id: Any) -> Optional[Dict[str, Any]]:
+    """The topic binding for an explicit (chat_id, thread_id), or None.
+
+    pre_gateway_dispatch runs BEFORE the dispatch layer binds the session
+    env (gateway/run_inbound.py:270), so the key is built from the event's
+    source, never from HERMES_SESSION_*.
+    """
+    tid = _norm_thread_id(thread_id)
+    if tid is None or not str(chat_id or "").strip():
+        return None
+    key = f"{chat_id}:{tid}"
+    try:
+        bindings = _load_state().get("topic_bindings")
+        entry = bindings.get(key) if isinstance(bindings, dict) else None
+    except Exception:
+        return None
+    return dict(entry) if isinstance(entry, dict) else None
+
+
+def _update_binding_session_at(chat_id: Any, thread_id: Any,
+                               session_id: Optional[str]) -> None:
+    """Record the session now working in an explicit topic (None resets).
+
+    Explicit-key variant of :func:`_update_binding_session` for callback
+    contexts, which carry no session env (see _session_key_from_query).
+    """
+    tid = _norm_thread_id(thread_id)
+    if tid is None or not str(chat_id or "").strip():
+        return
+    key = f"{chat_id}:{tid}"
+    clean = str(session_id).strip() if session_id is not None else ""
+    with _CWD_LOCK:
+        state = _load_state()
+        bindings = state.get("topic_bindings") or {}
+        entry = bindings.get(key)
+        if not isinstance(entry, dict):
+            return  # nothing to update — bind the topic first
+        entry["session_id"] = clean or None
+        entry["updated_at"] = int(time.time())
+        bindings[key] = entry
+        _save_state(state)
+
+
+def _binding_session_alive(session_id: str) -> bool:
+    """state.db still has a live (not ended) row for *session_id*."""
+    sid = str(session_id or "").strip()
+    if not sid:
+        return False
+    conn = _open_state_db()
+    if conn is None:
+        return False
+    try:
+        row = conn.execute(
+            "SELECT 1 FROM sessions WHERE id = ? AND ended_at IS NULL", (sid,)
+        ).fetchone()
+        return row is not None
+    except Exception:
+        return False
+    finally:
+        with _suppress(Exception):
+            conn.close()
+
+
+async def _send_sync_notice(chat_id: str, thread_id: Any, text: str) -> None:
+    """Best-effort text reply into the topic.
+
+    The pre_gateway_dispatch contract (run_inbound.py:114-146) has no reply
+    action — only skip/rewrite/allow — so the text is sent by the plugin
+    itself, like _notify_unbound_topic does (but awaited directly: this
+    hook already runs on the gateway loop).
+    """
+    native = _NATIVE
+    bot = getattr(native, "bot", None) if native is not None else None
+    if bot is None:
+        return
+    kwargs: Dict[str, Any] = {"chat_id": str(chat_id), "text": text}
+    tid = _norm_thread_id(thread_id)
+    if tid:
+        kwargs["message_thread_id"] = tid
+    try:
+        await bot.send_message(**kwargs)
+    except Exception:
+        logger.warning("tg-projects: sync notice send failed", exc_info=True)
+
+
+async def _on_pre_gateway_dispatch_sync(event, gateway, session_store=None, **kwargs):
+    """``pre_gateway_dispatch`` — seamless topic sync (fail-open, never blocks).
+
+    Bound topic (state.json topic_bindings["<chat>:<thread>"].session_id):
+    verify the chat's lane still points at that session; on drift re-point
+    it via SessionStore.switch_session (the /resume mechanism, CAS on the
+    current id), then return None so the message dispatches into the
+    re-pointed lane. When the lane has no entry yet (fresh process) the
+    switch is a no-op and the core's own topic-binding heal covers routing.
+
+    Unbound topic (no binding / empty session_id): reply "choose a project",
+    open the topic panel, and skip the message — free text without a project
+    cwd must not silently create a default-directory session.
+
+    Returns None in EVERY other case: no parking, no questions, no rewrite
+    (the retired Yes/No gate is gone; handoff.py is a passthrough).
+    """
+    try:
+        source = getattr(event, "source", None)
+        if source is None:
+            return None
+        if str(getattr(getattr(source, "platform", None), "value", "") or "") != "telegram":
+            return None
+        if bool(getattr(event, "internal", False)):
+            return None
+        text = str(getattr(event, "text", "") or "").strip()
+        if not text or text.startswith("/"):
+            return None  # commands keep the normal (interrupt-capable) path
+        if str(getattr(source, "chat_type", "") or "") != "dm":
+            return None  # bindings are DM-topic keyed
+        chat_id = str(getattr(source, "chat_id", "") or "").strip()
+        tid = _norm_thread_id(getattr(source, "thread_id", None))
+        if not chat_id or tid is None:
+            return None  # plain DM lane (no topic) — nothing to sync
+
+        binding = _binding_at(chat_id, tid)
+        bound_sid = str((binding or {}).get("session_id") or "").strip()
+        if not bound_sid:
+            key = f"{chat_id}:{tid}"
+            now = time.time()
+            if now - _SYNC_WARNED.get(key, 0.0) >= _SYNC_WARN_EVERY_S:
+                _SYNC_WARNED[key] = now
+                await _send_sync_notice(chat_id, tid, "Сначала выбери проект: /menu")
+            _panel = globals().get("_ensure_topic_panel")
+            if callable(_panel):
+                with _suppress(Exception):
+                    _panel(chat_id, tid)
+            return {"action": "skip", "reason": "unbound_topic"}
+
+        # Bound topic: steer the lane onto binding.session_id when drifted.
+        store = session_store if session_store is not None else getattr(
+            gateway, "session_store", None)
+        gen = getattr(gateway, "_generate_session_key", None)
+        sk = str(gen(source) or "") if callable(gen) else ""
+        if store is None or not sk:
+            return None  # cannot resolve the lane — fail-open
+        try:
+            entry = store.lookup_by_session_key(sk)
+        except Exception:
+            entry = None
+        current = str(getattr(entry, "session_id", "") or "") if entry is not None else ""
+        if current == bound_sid:
+            return None  # already in sync — plain dispatch
+        if not _binding_session_alive(bound_sid):
+            # Bound session ended/deleted: dispatch normally; the core's
+            # auto-reset/recover handles the dead lane.
+            return None
+        try:
+            async_store = getattr(gateway, "async_session_store", None)
+            if async_store is not None:
+                await async_store.switch_session(
+                    sk, bound_sid, expected_session_id=current or None)
+            else:
+                store.switch_session(sk, bound_sid,
+                                     expected_session_id=current or None)
+            logger.info(
+                "tg-projects: topic %s:%s lane re-pointed to bound session %s (was %s)",
+                chat_id, tid, bound_sid, current or "?")
+        except Exception:
+            logger.warning("tg-projects: binding sync switch failed; "
+                           "dispatching unchanged", exc_info=True)
+        return None
+    except Exception:
+        logger.warning("tg-projects: sync pre_gateway_dispatch failed", exc_info=True)
+        return None
+
+
+# ------------------------------------------------------- PC -> TG reply mirror
+# The desktop drives the same sessions through its OWN hermes serve process;
+# its replies go to the desktop UI, not the Telegram topic (delivery needs
+# the TG adapter, which only the TG gateway runs — authz_mixin.py
+# _delivery_adapter_for fails closed without it). This poller watches
+# state.db for NEW assistant messages in topic-bound sessions and mirrors
+# them into the topic. TG-side turns are skipped: their replies were already
+# delivered by the adapter (turn lease holder platform=telegram).
+_PC_MIRROR_INTERVAL_S = 5.0
+_PC_MIRROR_TG_GRACE_S = 60.0
+_PC_MIRROR_SEEN: Dict[str, int] = {}        # session_id -> last seen message id
+_PC_MIRROR_TG_UNTIL: Dict[str, float] = {}  # session_id -> rows before this ts are TG-side
+_PC_MIRROR_TASK: Optional["asyncio.Task"] = None
+
+
+def _pc_mirror_lease_tg_until(session_id: str) -> Optional[float]:
+    """Until when assistant rows for *session_id* count as TG-delivered.
+
+    A fresh lease with holder platform=telegram means this gateway runs the
+    turn and the adapter delivers the reply itself. The window is remembered
+    (expires_at + grace) so the final transcript flush that lands right
+    after the lease is released is not mirrored a second time.
+    """
+    path = _hermes_home() / "state.db"
+    if not path.exists():
+        return None
+    conn = None
+    try:
+        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=5.0)
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT holder, expires_at FROM session_turn_leases WHERE conversation_id = ?",
+            (session_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        holder = str(row["holder"] or "")
+        m = re.search(r"platform=([a-z_]+)", holder)
+        if m and m.group(1) == "telegram":
+            return float(row["expires_at"] or 0.0) + _PC_MIRROR_TG_GRACE_S
+        return None
+    except Exception:
+        return None
+    finally:
+        if conn is not None:
+            with _suppress(Exception):
+                conn.close()
+
+
+async def _pc_reply_mirror_loop(native: Any) -> None:
+    """Mirror desktop-side assistant messages of bound sessions into topics."""
+    bot = getattr(native, "bot", None)
+    if bot is None:
+        return
+    while True:
+        try:
+            await asyncio.sleep(_PC_MIRROR_INTERVAL_S)
+            try:
+                raw = _load_state().get("topic_bindings") or {}
+            except Exception:
+                raw = {}
+            bindings: Dict[str, str] = {}
+            for key, entry in raw.items():
+                if not isinstance(entry, dict):
+                    continue
+                sid = str(entry.get("session_id") or "").strip()
+                if sid:
+                    bindings[sid] = str(key)  # "<chat_id>:<thread_id>"
+            path = _hermes_home() / "state.db"
+            if not bindings or not path.exists():
+                continue
+            conn = None
+            rows_by_sid: Dict[str, list] = {}
+            try:
+                conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=5.0)
+                conn.row_factory = sqlite3.Row
+                for sid in bindings:
+                    since = _PC_MIRROR_SEEN.get(sid, 0)
+                    rows = conn.execute(
+                        "SELECT id, content, timestamp FROM messages "
+                        "WHERE session_id = ? AND role = 'assistant' AND id > ? "
+                        "ORDER BY id LIMIT 20",
+                        (sid, since),
+                    ).fetchall()
+                    if rows:
+                        rows_by_sid[sid] = rows
+            except Exception:
+                logger.debug("tg-projects: pc mirror db read failed", exc_info=True)
+            finally:
+                if conn is not None:
+                    with _suppress(Exception):
+                        conn.close()
+            for sid, rows in rows_by_sid.items():
+                if sid not in _PC_MIRROR_SEEN:
+                    # Bootstrap: never replay history on (re)start — adopt
+                    # the current tail as "already seen".
+                    _PC_MIRROR_SEEN[sid] = int(rows[-1]["id"])
+                    continue
+                until = _pc_mirror_lease_tg_until(sid)
+                if until is not None:
+                    _PC_MIRROR_TG_UNTIL[sid] = until
+                tg_until = _PC_MIRROR_TG_UNTIL.get(sid, 0.0)
+                chat_id, _, tid = bindings[sid].partition(":")
+                for row in rows:
+                    _PC_MIRROR_SEEN[sid] = max(_PC_MIRROR_SEEN.get(sid, 0), int(row["id"]))
+                    if float(row["timestamp"] or 0) <= tg_until:
+                        continue  # TG-side turn — adapter already delivered it
+                    content = str(row["content"] or "").strip()
+                    if not content:
+                        continue
+                    kwargs: Dict[str, Any] = {
+                        "chat_id": chat_id, "text": "🖥️ " + content[:3500]}
+                    if tid.isdigit():
+                        kwargs["message_thread_id"] = int(tid)
+                    try:
+                        await bot.send_message(**kwargs)
+                    except Exception:
+                        logger.warning("tg-projects: pc mirror send failed",
+                                       exc_info=True)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.warning("tg-projects: pc mirror loop iteration failed",
+                           exc_info=True)
+
+
+def _start_pc_reply_mirror(native: Any) -> None:
+    """Start the mirror loop once per process (idempotent)."""
+    global _PC_MIRROR_TASK
+    if _PC_MIRROR_TASK is not None and not _PC_MIRROR_TASK.done():
+        return
+    try:
+        _PC_MIRROR_TASK = asyncio.get_running_loop().create_task(
+            _pc_reply_mirror_loop(native))
+        logger.info("tg-projects: pc reply mirror started")
+    except RuntimeError:
+        pass  # factory ran off-loop; mirror stays off
+
+
 # ------------------------------------------------------------------ config -> topic -> project
 # In-process caches: the config mtime gate makes externally created topics visible
 # without a restart, and _CWD_APPLIED keeps the binders idempotent (one write per
@@ -652,6 +975,44 @@ def _save_state(state: dict) -> None:
     tmp = _STATE_FILE.with_suffix(".tmp")
     tmp.write_text(json.dumps(state, ensure_ascii=False, indent=1), encoding="utf-8")
     os.replace(tmp, _STATE_FILE)
+
+
+def _prune_stale_state(max_age_days: int = 7) -> int:
+    """Drop topic_bindings/topic_panels entries untouched for *max_age_days*.
+
+    Entries without a numeric ``updated_at`` are kept (age unknown); a missing
+    ``topic_panels`` bucket is fine. Returns the number of removed entries;
+    I/O errors are logged, never raised (returns 0).
+    """
+    cutoff = time.time() - max_age_days * 86400
+    removed = 0
+    try:
+        with _CWD_LOCK:
+            state = _load_state()
+            changed = False
+            for key in ("topic_bindings", "topic_panels"):
+                bucket = state.get(key)
+                if not isinstance(bucket, dict) or not bucket:
+                    continue
+                for entry_key, entry in list(bucket.items()):
+                    if not isinstance(entry, dict):
+                        continue
+                    ts = entry.get("updated_at")
+                    if isinstance(ts, bool) or not isinstance(ts, (int, float)):
+                        continue  # no valid timestamp — keep, never guess
+                    if ts < cutoff:
+                        bucket.pop(entry_key, None)
+                        removed += 1
+                        changed = True
+                if not bucket:
+                    state.pop(key, None)
+                    changed = True
+            if changed:
+                _save_state(state)
+    except Exception:
+        logger.warning("tg-projects: stale state prune failed", exc_info=True)
+        return 0
+    return removed
 
 
 # --------------------------------------------------------------------------- queries
@@ -1130,28 +1491,6 @@ def _create_project_and_topic(name: str, path: str, *, create_folder: bool,
     )
 
 
-def _thread_id_for_topic(adapter: Any, chat_id: str, topic_name: str):
-    """The thread_id of *topic_name* in *chat_id*: the adapter's cache first
-    (topics the gateway already knows), then a live topic creation.
-
-    ``ensure_dm_topic`` creates the topic when missing and persists the id; it
-    returns None when the chat has Threaded Mode disabled. Nothing here writes
-    config.yaml except via the adapter's own ``_persist_dm_topic_thread_id``
-    (which records name/thread_id only — no project data, so the mapping stays
-    in this plugin's state.json).
-    """
-    ensure = getattr(adapter, "ensure_dm_topic", None)
-    if not callable(ensure):
-        return None
-    thread_id = ensure(chat_id, topic_name)
-    if thread_id:
-        return thread_id
-    create = getattr(adapter, "_create_dm_topic", None)
-    if not callable(create):
-        return None
-    return create(int(chat_id), name=topic_name)
-
-
 def _make_light_project(name: str, cwd: str, pid=None) -> Any:
     """A minimal project-shaped object for the helpers that only need name/cwd/id."""
     ns = types.SimpleNamespace(name=name, slug="", primary_path=cwd, folders=[])
@@ -1461,18 +1800,27 @@ async def _tg_on_button(update: Any, context: Any) -> None:
     except Exception:
         pass
 
-    # Handoff Yes/No buttons (tgp:ho:<session_id>:y|n) — consumed before the
-    # project-menu dispatch: they answer a prompt, not open a menu.
-    if data.startswith("tgp:ho:"):
-        consumed = await _handle_handoff_callback(query, data)
-        if consumed:
-            with _suppress(Exception):
-                await query.answer()
-            return
+    # Approval buttons (tgp:a:<choice>:<rid>:<digest8>) — answer a tg-topics
+    # transport prompt; consumed before the project-menu dispatch, like every
+    # prompt-style callback.
+    m_appr = _APPROVAL_CB_RE.match(data)
+    if m_appr is not None:
+        await _handle_approval_callback(query, m_appr)
+        return
+
+    # Topic panel buttons (tgp:pb:*) — the pinned panel's own screens; they edit
+    # the panel message in place and never fall through to the project menus.
+    if data.startswith("tgp:pb:"):
+        await _handle_panel_callback(query, data)
+        return
 
     m = _CB_SESSION_RE.match(data)
     if m is not None:  # tgp:s:<id> — continue a listed session
         await _do_resume_by_id(query, m.group(1))
+        return
+
+    if data.startswith("tgp:pw:"):  # project wizard: [➕ Новый] / [❌ Отмена]
+        await _wizard_on_button(query, data)
         return
 
     if data == "tgp:np":  # new project: step-by-step text guide for /pproject
@@ -1500,7 +1848,7 @@ async def _tg_on_button(update: Any, context: Any) -> None:
     project = _project_at(projects, index_str)
     state_conn = _sessions_state_conn()
     try:
-        if action in ("p", "m"):  # project button → menu
+        if action == "p":  # project button → menu
             if project is None:
                 raise _ProjectMoved(f"Проект #{index_str} больше не в списке — закройте и выберите заново.")
             await _edit_menu(query, projects, project, index_str, state_conn)
@@ -1586,6 +1934,12 @@ async def _do_resume_by_id(query, session_id: str) -> None:
     finally:
         with _suppress(Exception):
             state_conn.close()
+    # Seamless sync: the resumed session becomes the topic's bound session,
+    # so the topic's next free text follows it (pre_gateway_dispatch sync).
+    if source is not None:
+        _update_binding_session_at(
+            str(getattr(source, "chat_id", "") or ""),
+            getattr(source, "thread_id", None), session_id)
     if cross_origin and admin:
         cmd = f"/resume --all {session_id}"
         suffix = " (кросс-оригин: admin --all)"
@@ -1865,6 +2219,14 @@ async def _do_resume(query, project, index_str: str, state_conn) -> None:
     # is not there yet), instead of stamping _CWD_APPLIED by hand.
     _apply_session_cwd(target["id"], cwd, "resume")
 
+    # Seamless sync: bind the topic to the resumed session so its next free
+    # text lands in the SAME sessions.id (pre_gateway_dispatch sync hook).
+    source = _adapter_source_for(query)
+    if source is not None:
+        _update_binding_session_at(
+            str(getattr(source, "chat_id", "") or ""),
+            getattr(source, "thread_id", None), target["id"])
+
     lines = [
         f"▶️ Продолжаю сессию {target['id']} ({_fmt_ts(target['started_at'])})",
         f"Каталог: {cwd}",
@@ -1966,6 +2328,7 @@ def _telegram_wire(native: Any, adapter: Any) -> None:
         from telegram.ext import CallbackQueryHandler
         native.add_handler(CallbackQueryHandler(_tg_on_button, pattern=r"^tgp:"))
         logger.info("tg-projects: telegram callback handler wired (pattern ^tgp:)")
+        _start_pc_reply_mirror(native)
     except Exception:
         logger.warning("tg-projects: telegram wiring failed", exc_info=True)
         _NATIVE = None
@@ -1973,90 +2336,1252 @@ def _telegram_wire(native: Any, adapter: Any) -> None:
 
 
 # --------------------------------------------------------------- session handoff
-# Cross-device continuity (Telegram ↔ desktop) lives in handoff.py: the
-# pre_gateway_dispatch hook parks an inbound message while the session runs
-# on the desktop and asks Yes/No; the tgp:ho:* callbacks act on the answer.
-def _import_handoff():
-    pkg = __package__ or ""
-    if pkg:
-        try:
-            return __import__(f"{pkg}.handoff", fromlist=["*"])
-        except ImportError:
-            pass
-    import importlib.util
-    spec = importlib.util.spec_from_file_location("tg_projects_handoff", str(_PLUG_DIR / "handoff.py"))
-    module = importlib.util.module_from_spec(spec)
-    sys.modules.setdefault("tg_projects_handoff", module)
-    spec.loader.exec_module(module)
-    return module
+# Cross-device continuity lives in handoff.py (legacy module, retained but
+# never called: its pre_gateway_dispatch hook is a passthrough and register()
+# wires the seamless-sync hook instead). The Yes/No callback flow is gone.
 
 
-async def _handle_handoff_callback(query, data: str) -> bool:
-    """Route ``tgp:ho:<token>:(y|n)`` taps. True when consumed.
+# ------------------------------------------------------------------- topic panel
+# One pinned message per topic: state.json["topic_panels"]["<chat_id>:<thread_id>"]
+# = message_id. /menu recreates it (unpin + delete the old panel, send, pin).
+# Sub-screens ([📁 Проект] list, [🧵 Сессия] list, Approvals, Ещё) edit the panel
+# message in place; every sub-screen carries a "⬅️ Назад" (tgp:pb:back) button
+# that re-renders the panel. Binding writes here use an explicit chat/thread key
+# (tgp:pb:* callbacks run on the event loop without a session-env scope, so
+# _set_topic_binding's contextvar key is unavailable in a callback).
+_PB_CB_PREFIX = "tgp:pb:"
+_PB_SESSIONS_LIMIT = 20
+_PB_CB_PROJ_RE = re.compile(r"^tgp:pb:projp:(\d+)$")
+_PB_CB_SESS_RE = re.compile(r"^tgp:pb:sesss:([A-Za-z0-9_\-]{8,46})$")
+_PB_CB_MORE_RE = re.compile(r"^tgp:pb:more:cmd:(status|diff|agents|help)$")
 
-    The callback_data carries an opaque 8-hex token (not the session_id —
-    that would blow the 64-byte Telegram cap for real session ids). The
-    real ``session_id`` / ``session_key`` are looked up from
-    ``handoff_tokens`` in state.json via ``handoff.consume_token``, which
-    also deletes the row so a second tap lands on the "expired" reply.
-    """
-    import re as _re
-    m = _re.match(r"^tgp:ho:([a-f0-9]{8}):(y|n)$", str(data or ""))
-    if m is None:
+
+def _pb_panel_key(chat_id: Any, thread_id: Any) -> str:
+    """``f"{chat_id}:{thread_id}"`` (thread 0 = plain DM panel)."""
+    return f"{chat_id}:{int(thread_id or 0)}"
+
+
+def _pb_get_panel_message_id(chat_id: str, thread_id: Optional[int]) -> Optional[int]:
+    """The pinned panel's message_id for this chat/thread, or None."""
+    try:
+        value = (_load_state().get("topic_panels") or {}).get(_pb_panel_key(chat_id, thread_id))
+    except Exception:
+        return None
+    text = str(value or "").strip()
+    return int(text) if text.isdigit() else None
+
+
+def _pb_set_panel_message_id(chat_id: str, thread_id: Optional[int], message_id: int) -> None:
+    with _CWD_LOCK:
+        state = _load_state()
+        state.setdefault("topic_panels", {})[_pb_panel_key(chat_id, thread_id)] = int(message_id)
+        _save_state(state)
+
+
+def _pb_clear_panel(chat_id: str, thread_id: Optional[int]) -> None:
+    """Forget the panel message id (called before a fresh panel is sent)."""
+    with _CWD_LOCK:
+        state = _load_state()
+        panels = state.get("topic_panels") or {}
+        if panels.pop(_pb_panel_key(chat_id, thread_id), None) is not None:
+            if not panels:
+                state.pop("topic_panels", None)
+            _save_state(state)
+
+
+def _pb_binding(chat_id: str, thread_id: Optional[int]) -> Optional[Dict[str, Any]]:
+    """The topic's topic_bindings entry, read by an explicit key (a copy)."""
+    if thread_id is None:
+        return None
+    try:
+        entry = (_load_state().get("topic_bindings") or {}).get(f"{chat_id}:{thread_id}")
+    except Exception:
+        return None
+    return dict(entry) if isinstance(entry, dict) else None
+
+
+def _pb_write_binding(chat_id: str, thread_id: Optional[int], project_id: Any,
+                      project_name: Any, cwd: Any, session_id: Any = None) -> bool:
+    """Create/refresh the binding at an explicit key; the session resets to None
+    (the [📁 Проект] pick semantics: _set_topic_binding + _update_binding_session(None))."""
+    if thread_id is None:
         return False
-    token, answer = m.group(1), m.group(2)
-    handoff = _import_handoff()
-    resolved = handoff.consume_token(token)
-    if resolved is None:
-        with _suppress(Exception):
-            await query.edit_message_text(
-                "⚠️ Запрос устарел (истёк или уже использован). "
-                "Отправьте сообщение заново.")
-        return True
-    session_id, sk = resolved
-    if not sk:
-        sk = _current_session_key() or _session_key_from_query(query)
-    if answer == "n":
-        handoff.drop_pending(sk)
-        with _suppress(Exception):
-            await query.edit_message_text(
-                "Оставил как есть — сессия продолжает работать на другом устройстве. "
-                "Сообщение не отправлено.")
-        return True
+    key = f"{chat_id}:{thread_id}"
+    clean = str(session_id).strip() if session_id is not None else ""
+    with _CWD_LOCK:
+        state = _load_state()
+        bindings = state.setdefault("topic_bindings", {})
+        entry = bindings.get(key) if isinstance(bindings.get(key), dict) else {}
+        entry["project_id"] = str(project_id)
+        entry["project_name"] = str(project_name)
+        entry["cwd"] = str(cwd)
+        entry["session_id"] = clean or None
+        entry["updated_at"] = int(time.time())
+        bindings[key] = entry
+        _save_state(state)
+    return True
 
-    pending = await handoff.perform_handoff(sk, session_id)
-    if pending is None:
+
+def _pb_write_binding_session(chat_id: str, thread_id: Optional[int],
+                              session_id: Optional[str]) -> bool:
+    """Record the topic's working session at an explicit key (None resets)."""
+    if thread_id is None:
+        return False
+    key = f"{chat_id}:{thread_id}"
+    with _CWD_LOCK:
+        state = _load_state()
+        bindings = state.get("topic_bindings") or {}
+        entry = bindings.get(key)
+        if not isinstance(entry, dict):
+            return False  # bind the topic first
+        clean = str(session_id).strip() if session_id is not None else ""
+        entry["session_id"] = clean or None
+        entry["updated_at"] = int(time.time())
+        bindings[key] = entry
+        _save_state(state)
+    return True
+
+
+def _pb_session_status(state_conn, session_id: str) -> str:
+    """The live status string ('online'/'idle') for a bound session."""
+    try:
+        return str(_session_live_status(state_conn, session_id).get("status") or "idle")
+    except Exception:
+        return "idle"
+
+
+def _pb_short_session_id(session_id: str) -> str:
+    text = str(session_id or "").strip()
+    return text[:12] + "…" if len(text) > 12 else text
+
+
+def _pb_panel_text(binding: Optional[Dict[str, Any]], status: str = "") -> str:
+    """The pinned panel body: project / session / cwd."""
+    if not binding:
+        return "📁  —\n🧵  —\n📂  —\n\nСначала выбери проект: [📁 Проект]"
+    session_id = str(binding.get("session_id") or "").strip()
+    session_line = f"{_pb_short_session_id(session_id)} · {status or 'idle'}" if session_id else "—"
+    return (
+        f"📁  {binding.get('project_name') or '—'}\n"
+        f"🧵  {session_line}\n"
+        f"📂  {binding.get('cwd') or '—'}"
+    )
+
+
+def _pb_panel_keyboard():
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📁 Проект", callback_data=f"{_PB_CB_PREFIX}proj"),
+         InlineKeyboardButton("🧵 Сессия", callback_data=f"{_PB_CB_PREFIX}sess"),
+         InlineKeyboardButton("➕ Новая", callback_data=f"{_PB_CB_PREFIX}new")],
+        [InlineKeyboardButton("▶️ Resume", callback_data=f"{_PB_CB_PREFIX}res"),
+         InlineKeyboardButton("⏹ Stop", callback_data=f"{_PB_CB_PREFIX}stop"),
+         InlineKeyboardButton("⚠️ Approvals", callback_data=f"{_PB_CB_PREFIX}appr"),
+         InlineKeyboardButton("⚙️ Ещё", callback_data=f"{_PB_CB_PREFIX}more")],
+    ])
+
+
+def _pb_back_keyboard():
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+    return InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data=f"{_PB_CB_PREFIX}back")]])
+
+
+async def _pb_create(chat_id: str, thread_id: Optional[int]) -> bool:
+    """(Re)create the pinned panel: unpin + delete the old message, send, pin, record."""
+    bot = getattr(_NATIVE, "bot", None) if _NATIVE is not None else None
+    if bot is None or not chat_id:
+        return False
+
+    old_id = _pb_get_panel_message_id(chat_id, thread_id)
+    if old_id is not None:
+        try:
+            if hasattr(bot, "unpin_chat_message"):
+                await bot.unpin_chat_message(chat_id=int(chat_id), message_id=int(old_id))
+        except Exception:
+            logger.debug("tg-projects: old panel unpin failed", exc_info=True)
+        try:
+            if hasattr(bot, "delete_message"):
+                await bot.delete_message(chat_id=int(chat_id), message_id=int(old_id))
+        except Exception:
+            logger.debug("tg-projects: old panel delete failed", exc_info=True)
+        _pb_clear_panel(chat_id, thread_id)
+
+    binding = _pb_binding(chat_id, thread_id)
+    status = ""
+    if binding and binding.get("session_id"):
+        state_conn = _sessions_state_conn()
+        try:
+            status = _pb_session_status(state_conn, str(binding.get("session_id")))
+        finally:
+            with _suppress(Exception):
+                state_conn.close()
+
+    kwargs: Dict[str, Any] = {
+        "chat_id": chat_id,
+        "text": _pb_panel_text(binding, status),
+        "reply_markup": _pb_panel_keyboard(),
+    }
+    if thread_id:
+        kwargs["message_thread_id"] = int(thread_id)
+    try:
+        message = await bot.send_message(**kwargs)
+    except Exception:
+        logger.warning("tg-projects: panel send failed", exc_info=True)
+        return False
+    message_id = getattr(message, "message_id", None)
+    if not message_id:
+        return False
+    _pb_set_panel_message_id(chat_id, thread_id, int(message_id))
+    try:
+        if hasattr(bot, "pin_chat_message"):
+            await bot.pin_chat_message(chat_id=int(chat_id), message_id=int(message_id),
+                                       disable_notification=True)
+    except Exception:
+        logger.warning("tg-projects: panel pin failed", exc_info=True)
+    return True
+
+
+def _ensure_topic_panel(chat_id: Any, thread_id: Any) -> None:
+    """Create the topic panel when absent (sync hook's unbound-topic path).
+
+    Sync (thread) context: the coroutine is scheduled onto the wired loop;
+    a missing panel or wiring degrades silently.
+    """
+    chat = str(chat_id or "").strip()
+    tid = _norm_thread_id(thread_id)
+    if not chat:
+        return
+    if _pb_get_panel_message_id(chat, tid) is not None:
+        return  # panel already pinned — the binding data lives on it
+    native = _NATIVE
+    loop = _WIRE_LOOP
+    if native is None or loop is None:
+        return
+
+    async def _make() -> None:
+        with _suppress(Exception):
+            await _pb_create(chat, tid)
+
+    try:
+        asyncio.run_coroutine_threadsafe(_make(), loop)
+    except Exception:
+        logger.debug("tg-projects: panel ensure scheduling failed", exc_info=True)
+
+
+async def _pb_render(query, chat_id: str, thread_id: Optional[int]) -> None:
+    """Edit the panel message back to the panel view."""
+    binding = _pb_binding(chat_id, thread_id)
+    status = ""
+    if binding and binding.get("session_id"):
+        state_conn = _sessions_state_conn()
+        try:
+            status = _pb_session_status(state_conn, str(binding.get("session_id")))
+        finally:
+            with _suppress(Exception):
+                state_conn.close()
+    with _suppress(Exception):
+        await query.edit_message_text(_pb_panel_text(binding, status),
+                                      reply_markup=_pb_panel_keyboard())
+
+
+def _pb_projects_text(projects: list) -> str:
+    if not projects:
+        return "📁 Проектов пока нет — создайте: /pproject <название> <абсолютный путь>"
+    return "📁 Выбор проекта (закрепит его за этим топиком):"
+
+
+async def _pb_project_screen(query, chat_id: str, thread_id: Optional[int]) -> None:
+    """[📁 Проект]: the project list — one tgp:pb:projp:<i> button per project."""
+    try:
+        projects = _list_projects()
+    except Exception as exc:
+        with _suppress(Exception):
+            await query.edit_message_text(f"Не удалось прочитать проекты: {exc}",
+                                          reply_markup=_pb_back_keyboard())
+        return
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+    rows = [[InlineKeyboardButton(f"📁 {p.name} [{p.slug}]",
+                                  callback_data=f"{_PB_CB_PREFIX}projp:{i}")]
+            for i, p in enumerate(projects, 1)]
+    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data=f"{_PB_CB_PREFIX}back")])
+    with _suppress(Exception):
+        await query.edit_message_text(_pb_projects_text(projects),
+                                      reply_markup=InlineKeyboardMarkup(rows))
+
+
+async def _pb_pick_project(query, chat_id: str, thread_id: Optional[int],
+                           index_str: str) -> None:
+    """A tgp:pb:projp:<i> tap: bind the topic to the project, reset the session."""
+    if thread_id is None:
         with _suppress(Exception):
             await query.edit_message_text(
-                "⚠️ Запрос устарел (истёк или сессия сменилась). "
-                "Отправьте сообщение заново.")
-        return True
+                "Привязка работает в топике форума — откройте /menu в топике проекта.",
+                reply_markup=_pb_back_keyboard())
+        return
+    try:
+        projects = _list_projects()
+    except Exception as exc:
+        with _suppress(Exception):
+            await query.edit_message_text(f"Не удалось прочитать проекты: {exc}",
+                                          reply_markup=_pb_back_keyboard())
+        return
+    project = _project_at(projects, index_str)
+    if project is None:
+        with _suppress(Exception):
+            await query.edit_message_text(f"Проект #{index_str} больше не в списке — выберите заново.",
+                                          reply_markup=_pb_back_keyboard())
+        return
+    cwd = _project_cwd(project)
+    if not cwd or not os.path.isdir(cwd):
+        with _suppress(Exception):
+            await query.edit_message_text(f"Каталог {cwd or 'не указан'} недоступен — проект не привязан.",
+                                          reply_markup=_pb_back_keyboard())
+        return
+    _pb_write_binding(chat_id, thread_id, getattr(project, "id", None),
+                      getattr(project, "name", None), cwd, None)
+    await _pb_render(query, chat_id, thread_id)
 
+
+def _pb_sessions_text(binding: Optional[Dict[str, Any]], sessions: list) -> str:
+    """The [🧵 Сессия] sub-screen body (all sessions of the project cwd)."""
+    if not binding or not binding.get("cwd"):
+        return "🧵 Сначала выбери проект: [📁 Проект]."
+    lines = [f"🧵 Сессии проекта {binding.get('project_name') or '?'}:"]
+    if not sessions:
+        lines.append("(нет сессий в этом каталоге)")
+    else:
+        for s in sessions:
+            flag = "🖥️ " if s.get("source") == "desktop" else ""
+            lines.append(f"{flag}• {_pb_short_session_id(s['id'])} · "
+                         f"{s.get('status') or 'idle'} · {s.get('message_count', 0)} msg")
+    return "\n".join(lines)
+
+
+async def _pb_sessions_screen(query, chat_id: str, thread_id: Optional[int]) -> None:
+    """[🧵 Сессия]: every session of the binding cwd (no source filter), up to 20."""
+    binding = _pb_binding(chat_id, thread_id)
+    sessions: list = []
+    if binding and binding.get("cwd"):
+        state_conn = _sessions_state_conn()
+        try:
+            sessions = _sessions_for_cwd(state_conn, str(binding["cwd"]),
+                                         limit=_PB_SESSIONS_LIMIT)
+        finally:
+            with _suppress(Exception):
+                state_conn.close()
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+    rows = [[InlineKeyboardButton(
+                 f"▶️ {('🖥️ ' if s.get('source') == 'desktop' else '')}"
+                 f"{_pb_short_session_id(s['id'])} · {s.get('status') or 'idle'}",
+                 callback_data=f"{_PB_CB_PREFIX}sesss:{s['id']}")]
+            for s in sessions]
+    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data=f"{_PB_CB_PREFIX}back")])
+    with _suppress(Exception):
+        await query.edit_message_text(_pb_sessions_text(binding, sessions),
+                                      reply_markup=InlineKeyboardMarkup(rows))
+
+
+async def _pb_pick_session(query, chat_id: str, thread_id: Optional[int],
+                           session_id: str) -> None:
+    """A tgp:pb:sesss:<id> tap: bind the session, resume it, re-render the panel."""
+    if thread_id is None:
+        with _suppress(Exception):
+            await query.edit_message_text(
+                "Сессии привязываются в топике форума — /menu в топике проекта.",
+                reply_markup=_pb_back_keyboard())
+        return
+    state_conn = _sessions_state_conn()
+    try:
+        with _suppress(Exception):
+            row = state_conn.execute("SELECT id FROM sessions WHERE id = ?",
+                                     (session_id,)).fetchone()
+        found = row is not None
+    finally:
+        with _suppress(Exception):
+            state_conn.close()
+    if not found:
+        with _suppress(Exception):
+            await query.edit_message_text(
+                f"❌ Сессия {session_id} не найдена — обновите список: [🧵 Сессия].",
+                reply_markup=_pb_back_keyboard())
+        return
+    _pb_write_binding_session(chat_id, thread_id, session_id)
+    await _do_resume_by_id(query, session_id)
+    await _pb_render(query, chat_id, thread_id)
+
+
+async def _pb_new_session(query, chat_id: str, thread_id: Optional[int]) -> None:
+    """[➕ Новая]: /new in the binding cwd; on_session_start records the session id."""
+    binding = _pb_binding(chat_id, thread_id)
+    if not binding or not binding.get("cwd") or not os.path.isdir(str(binding["cwd"])):
+        with _suppress(Exception):
+            await query.edit_message_text("➕ Сначала выбери проект: [📁 Проект].",
+                                          reply_markup=_pb_back_keyboard())
+        return
+    project = _make_light_project(str(binding.get("project_name")),
+                                  str(binding["cwd"]), binding.get("project_id"))
+    state_conn = _sessions_state_conn()
+    try:
+        await _do_new_session(query, project, "", state_conn)
+    finally:
+        with _suppress(Exception):
+            state_conn.close()
+    await _pb_render(query, chat_id, thread_id)
+
+
+async def _pb_resume(query, chat_id: str, thread_id: Optional[int]) -> None:
+    """[▶️ Resume]: /resume the bound session, or tell the user to pick one."""
+    binding = _pb_binding(chat_id, thread_id)
+    session_id = str((binding or {}).get("session_id") or "").strip()
+    if not session_id:
+        with _suppress(Exception):
+            await query.edit_message_text("▶️ Сначала выбери сессию: [🧵 Сессия].",
+                                          reply_markup=_pb_back_keyboard())
+        return
+    await _do_resume_by_id(query, session_id)
+    await _pb_render(query, chat_id, thread_id)
+
+
+async def _pb_stop(query) -> None:
+    """[⏹ Stop]: /stop is a real gateway command (interrupt_then_dispatch), so a
+    synthetic event stops the running turn of this chat's session in both idle
+    and busy states."""
+    if _ADAPTER is None:
+        with _suppress(Exception):
+            await query.edit_message_text("⏹ Остановка недоступна (адаптер не подключён).",
+                                          reply_markup=_pb_back_keyboard())
+        return
     with _suppress(Exception):
         await query.edit_message_text(
-            f"✅ Сессия {session_id} переключена сюда. Десктоп получит уведомление; "
-            "отправляю ваше сообщение…")
+            "⏹ Останавливаю текущую сессию (/stop) — ответ придёт ниже.",
+            reply_markup=_pb_back_keyboard())
+    await _send_gateway_command(query, "/stop")
 
-    # Re-dispatch the parked message through the gateway as a real turn.
-    text = str(pending.get("text") or "")
-    adapter = _ADAPTER
-    if text and adapter is not None:
-        from gateway.platforms.event import MessageEvent, MessageType
-        src = pending.get("source") or {}
-        source = _ADAPTER.build_source(
-            chat_id=str(src.get("chat_id") or ""),
-            chat_type="dm",
-            user_id=str(src.get("user_id") or "") or None,
-            user_name=src.get("user_name") or None,
-            thread_id=str(src.get("thread_id") or "") or None,
-        )
-        event = MessageEvent(
-            text=text, message_type=MessageType.TEXT, source=source,
-            message_id=str(src.get("message_id") or ""), reply_expected=True,
-            allow_gateway_control=True, internal=False,
-        )
-        await adapter.handle_message(event)
-    return True
+
+async def _pb_approvals_screen(query) -> None:
+    """[⚠️ Approvals]: the exec-approval explanation screen."""
+    text = (
+        "⚠️ Подтверждения (approvals)\n\n"
+        "Кнопки одобрения («Разрешить»/«Отклонить») приходят в чат автоматически, "
+        "когда агент запускает опасную команду (shell, запись в файлы и т.п.). "
+        "Отвечайте на них прямо в сообщении с кнопками — отдельной настройки на "
+        "панели нет.\n\n"
+        "Если кнопка не нажимается — ответьте текстом в чат."
+    )
+    with _suppress(Exception):
+        await query.edit_message_text(text, reply_markup=_pb_back_keyboard())
+
+
+async def _pb_more_screen(query) -> None:
+    """[⚙️ Ещё]: the reference-command sub-menu."""
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+    rows = [[InlineKeyboardButton(f"/{name}", callback_data=f"{_PB_CB_PREFIX}more:cmd:{name}")]
+            for name in ("status", "diff", "agents", "help")]
+    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data=f"{_PB_CB_PREFIX}back")])
+    with _suppress(Exception):
+        await query.edit_message_text(
+            "⚙️ Ещё — справочные команды (ответ придёт отдельным сообщением):",
+            reply_markup=InlineKeyboardMarkup(rows))
+
+
+async def _pb_run_command(query, name: str) -> None:
+    """A tgp:pb:more:cmd:<name> tap: send /<name> through the gateway."""
+    if _ADAPTER is None:
+        with _suppress(Exception):
+            await query.edit_message_text(f"⚠️ /{name} сейчас недоступен (адаптер не подключён).",
+                                          reply_markup=_pb_back_keyboard())
+        return
+    with _suppress(Exception):
+        await query.edit_message_text(f"Отправляю /{name} — ответ придёт ниже.",
+                                      reply_markup=_pb_back_keyboard())
+    await _send_gateway_command(query, f"/{name}")
+
+
+async def _handle_panel_callback(query, data: str) -> None:
+    """Route tgp:pb:* taps; every screen edits the panel message in place."""
+    msg = getattr(query, "message", None)
+    chat_id = str(getattr(msg, "chat_id", "") or "").strip()
+    thread_id = _norm_thread_id(getattr(msg, "message_thread_id", None))
+    rest = data[len(_PB_CB_PREFIX):]
+    try:
+        if not chat_id:
+            await query.answer()
+            return
+        if rest == "back":
+            await _pb_render(query, chat_id, thread_id)
+        elif rest == "proj":
+            await _pb_project_screen(query, chat_id, thread_id)
+        elif rest == "sess":
+            await _pb_sessions_screen(query, chat_id, thread_id)
+        elif rest == "new":
+            await _pb_new_session(query, chat_id, thread_id)
+        elif rest == "res":
+            await _pb_resume(query, chat_id, thread_id)
+        elif rest == "stop":
+            await _pb_stop(query)
+        elif rest == "appr":
+            await _pb_approvals_screen(query)
+        elif rest == "more":
+            await _pb_more_screen(query)
+        else:
+            m = _PB_CB_PROJ_RE.match(data)
+            if m is not None:
+                await _pb_pick_project(query, chat_id, thread_id, m.group(1))
+            else:
+                m = _PB_CB_SESS_RE.match(data)
+                if m is not None:
+                    await _pb_pick_session(query, chat_id, thread_id, m.group(1))
+                else:
+                    m = _PB_CB_MORE_RE.match(data)
+                    if m is not None:
+                        await _pb_run_command(query, m.group(1))
+        with _suppress(Exception):
+            await query.answer()
+    except Exception as exc:
+        logger.warning("tg-projects: panel callback %r failed: %s", data, exc, exc_info=True)
+        with _suppress(Exception):
+            await query.answer("Ошибка — см. лог hermes")
+
+
+async def _menu_command(raw_args: str) -> Optional[str]:
+    """Create/refresh the pinned topic panel (unpin + delete the old one first)."""
+    if (raw_args or "").strip():
+        return "Использование: /menu — без аргументов."
+    _prune_stale_state()  # drop bindings/panels untouched for 7 days
+    _wizard_reset_chat(str(_session_env("HERMES_SESSION_CHAT_ID", "") or "").strip())
+    chat_id = str(_session_env("HERMES_SESSION_CHAT_ID", "") or "").strip()
+    thread_id = _norm_thread_id(_current_thread_id())
+    if not chat_id:
+        return "Панель доступна только в Telegram-чате (не удалось определить чат)."
+    if _NATIVE is None or getattr(_NATIVE, "bot", None) is None:
+        return ("⚠️ Панель сейчас недоступна (фабрика Telegram не подключилась). "
+                "Текстом: /projects — список, /pnew <N> + /new — новая сессия.")
+    if not await _pb_create(chat_id, thread_id):
+        return "⚠️ Не удалось отправить панель — см. лог hermes."
+    return None
+
+
+# ------------------------------------------------------------- approval transport
+# tg-topics: presents host-owned dangerous-command approvals as Telegram
+# inline buttons. Registered via ctx.register_approval_transport but INACTIVE
+# until config.yaml selects it (``security.approval.transport: tg-topics``);
+# detection, allowed scopes, persistence and the fail-closed timeout stay
+# host-owned (hermes_cli.approval_transport.py).
+#
+# Routing: the host runs present_fn on a plain daemon worker thread, so
+# session ContextVars are NOT inherited there and the ApprovalRequest itself
+# carries NO session_key (it is only mixed into the digest). The requesting
+# session is recovered best-effort from HERMES_SESSION_ID (process env,
+# re-published by the gateway each turn) and mapped to a topic through
+# state.json topic_bindings (reverse lookup on session_id) and the state.db
+# sessions row (chat_id / thread_id). A miss walks the fallback chain (any
+# bound topic, then the owner's DM) — there is ALWAYS a place to present, so
+# the transport never auto-approves and never silently denies for lack of a
+# surface. A process without the Telegram adapter wired (desktop backend)
+# cannot send and fails closed to deny; set ``transport_fallback: builtin``
+# in config.yaml if that surface should fall back to its local prompt.
+_APPROVALS_KEY = "approvals_map"
+# tgp:a:<choice>:<request_id(32 hex)>:<digest prefix(8 hex)> — 55 bytes max.
+_APPROVAL_CB_RE = re.compile(
+    r"^tgp:a:(once|session|always|deny):([a-f0-9]{32}):([a-f0-9]{8})$")
+# The chat-whitelisted owner's DM: the always-available presentation target.
+_APPROVAL_FALLBACK_CHAT = "7559860199"
+# Hard cap on one presentation wait (the host default is 300s anyway).
+_APPROVAL_MAX_WAIT_S = 300.0
+# request_id -> {"event", "request", "choice"}: in-memory waiters the
+# callback handler wakes. Entries live only while _approval_present waits.
+_APPROVAL_WAITERS: Dict[str, Dict[str, Any]] = {}
+_APPROVAL_CHOICE_TEXT = {
+    "once": "✅ Одобрено (одноразово)",
+    "session": "✅ Одобрено до конца сессии",
+    "always": "✅✅ Одобрено всегда",
+    "deny": "❌ Отклонено",
+}
+
+
+def _approval_topic_from_bindings(session_id: str) -> Optional[tuple]:
+    """The topic whose binding records *session_id* (reverse lookup)."""
+    if not session_id:
+        return None
+    try:
+        bindings = _load_state().get("topic_bindings") or {}
+    except Exception:
+        return None
+    for key, entry in bindings.items():
+        if not isinstance(entry, dict):
+            continue
+        if str(entry.get("session_id") or "").strip() == session_id:
+            chat_s, _, thread_s = str(key).partition(":")
+            thread = _norm_thread_id(thread_s)
+            if chat_s and thread is not None:
+                return (chat_s, thread)
+    return None
+
+
+def _approval_topic_from_state_db(session_id: str) -> Optional[tuple]:
+    """The (chat_id, thread_id|None) state.db records for *session_id*."""
+    if not session_id:
+        return None
+    conn = None
+    try:
+        conn = _sessions_state_conn()
+        row = conn.execute(
+            "SELECT chat_id, thread_id FROM sessions WHERE id = ?",
+            (session_id,),
+        ).fetchone()
+    except Exception:
+        return None
+    finally:
+        if conn is not None:
+            with _suppress(Exception):
+                conn.close()
+    if row is None:
+        return None
+    chat = str(row["chat_id"] or "").strip()
+    if not chat:
+        return None  # desktop/CLI row: no Telegram route
+    return (chat, _norm_thread_id(row["thread_id"]))
+
+
+def _approval_any_bound_topic() -> Optional[tuple]:
+    """Any bound topic (newest first, session-bound preferred) — the
+    single-whitelist-user fallback when the requesting session is unknown."""
+    try:
+        bindings = _load_state().get("topic_bindings") or {}
+    except Exception:
+        return None
+    candidates: List[tuple] = []
+    for key, entry in bindings.items():
+        if not isinstance(entry, dict):
+            continue
+        chat_s, _, thread_s = str(key).partition(":")
+        thread = _norm_thread_id(thread_s)
+        if not chat_s or thread is None:
+            continue
+        rank = 1 if entry.get("session_id") else 0
+        candidates.append((rank, int(entry.get("updated_at") or 0), chat_s, thread))
+    if not candidates:
+        return None
+    best = max(candidates)
+    return (best[2], best[3])
+
+
+def _approval_target() -> tuple:
+    """(chat_id, thread_id|None) the approval prompt is shown in.
+
+    Priority: the requesting session's own topic (bindings reverse lookup,
+    then the state.db row), then any bound topic, then the owner's DM.
+    """
+    session_id = str(_session_env("HERMES_SESSION_ID", "") or "").strip()
+    topic = _approval_topic_from_bindings(session_id)
+    if topic is None:
+        topic = _approval_topic_from_state_db(session_id)
+    if topic is None:
+        topic = _approval_any_bound_topic()
+    if topic is not None:
+        return topic
+    return (_APPROVAL_FALLBACK_CHAT, None)
+
+
+def _tg_send_sync(kwargs: Dict[str, Any], wait_s: float) -> Any:
+    """bot.send_message on the gateway loop, waited synchronously.
+
+    Returns the sent Message, or None (no wiring, loop gone, send error,
+    wait timeout) — the caller fails closed on None.
+    """
+    loop, native = _WIRE_LOOP, _NATIVE
+    bot = getattr(native, "bot", None) if native is not None else None
+    if loop is None or bot is None:
+        return None
+
+    async def _send() -> Any:
+        return await bot.send_message(**kwargs)
+
+    try:
+        return asyncio.run_coroutine_threadsafe(
+            _send(), loop).result(timeout=max(float(wait_s), 1.0))
+    except Exception:
+        logger.warning("tg-projects: approval send failed", exc_info=True)
+        return None
+
+
+def _tg_edit_best_effort(chat_id: Any, message_id: Any, text: str) -> None:
+    """bot.edit_message_text from a worker thread; never raises."""
+    loop, native = _WIRE_LOOP, _NATIVE
+    bot = getattr(native, "bot", None) if native is not None else None
+    if loop is None or bot is None or not chat_id or not message_id:
+        return
+
+    async def _edit() -> None:
+        try:
+            await bot.edit_message_text(
+                chat_id=chat_id, message_id=message_id, text=text)
+        except Exception:
+            logger.debug("tg-projects: approval edit failed", exc_info=True)
+
+    try:
+        asyncio.run_coroutine_threadsafe(_edit(), loop)
+    except Exception:
+        pass
+
+
+def _approval_prune(now: float) -> None:
+    """Drop long-expired approvals_map entries and their waiters."""
+    with _CWD_LOCK:
+        try:
+            state = _load_state()
+        except Exception:
+            return
+        amap = state.get(_APPROVALS_KEY)
+        if not isinstance(amap, dict) or not amap:
+            return
+        stale = [rid for rid, entry in amap.items()
+                 if isinstance(entry, dict)
+                 and float(entry.get("expires") or 0) < now - 60]
+        if not stale:
+            return
+        for rid in stale:
+            amap.pop(rid, None)
+            _APPROVAL_WAITERS.pop(rid, None)
+        _save_state(state)
+
+
+def _approval_drop(rid: str) -> None:
+    """Remove one approvals_map entry (resolved, expired or failed)."""
+    with _CWD_LOCK:
+        try:
+            state = _load_state()
+        except Exception:
+            return
+        amap = state.get(_APPROVALS_KEY)
+        if isinstance(amap, dict) and rid in amap:
+            amap.pop(rid, None)
+            _save_state(state)
+
+
+def _approval_message(request: Any, timeout_s: float) -> str:
+    """The prompt text: description + redacted command (monospace block)."""
+    command = str(getattr(request, "command", "") or "")
+    if len(command) > 900:
+        command = command[:900] + "…"
+    description = _trim(str(getattr(request, "description", "") or ""), 300)
+    lines = ["⚠️ Требуется подтверждение команды Hermes"]
+    if description:
+        lines += ["", description]
+    lines += ["", f"```\n{command}\n```", "",
+              f"⏳ Без ответа через {int(timeout_s)} с — команда будет отклонена."]
+    return "\n".join(lines)
+
+
+def _approval_keyboard(rid: str, digest: str, allowed) -> Any:
+    """Inline buttons for the request. ``session``/``always`` only appear
+    when the host put them in allowed_choices; deny is always offered."""
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+
+    def cb(choice: str) -> str:
+        return f"tgp:a:{choice}:{rid}:{digest[:8]}"
+
+    rows = [[
+        InlineKeyboardButton("✅ Одобрить", callback_data=cb("once")),
+        InlineKeyboardButton("❌ Отклонить", callback_data=cb("deny")),
+    ]]
+    extra = []
+    if "session" in allowed:
+        extra.append(InlineKeyboardButton("✅▸ Сессия",
+                                          callback_data=cb("session")))
+    if "always" in allowed:
+        extra.append(InlineKeyboardButton("✅✅ Всегда",
+                                          callback_data=cb("always")))
+    if extra:
+        rows.append(extra)
+    return InlineKeyboardMarkup(rows)
+
+
+def _approval_present(request: Any) -> Any:
+    """ApprovalRequest -> ApprovalDecision: ask in Telegram, wait for the tap.
+
+    Fail-closed everywhere: no wiring, a failed send or a timeout returns
+    ``request.respond("deny")`` — silence is never consent. Sync on the
+    host's bounded daemon worker thread: one Event.wait, no polling, no
+    extra threads. Two concurrent approvals are two independent waiters;
+    approvals_map mutations share _CWD_LOCK with the other state writers.
+    """
+    try:
+        timeout_s = min(max(float(getattr(request, "timeout_seconds", 0) or 0),
+                            1.0), _APPROVAL_MAX_WAIT_S)
+        deadline = time.monotonic() + timeout_s
+        rid = str(getattr(request, "request_id", "") or "")
+        digest = str(getattr(request, "digest", "") or "")
+        allowed = tuple(getattr(request, "allowed_choices", ()) or ())
+        if not rid or not digest:
+            return request.respond("deny")
+        _approval_prune(time.time())
+
+        chat_id, thread_id = _approval_target()
+        kwargs: Dict[str, Any] = {
+            "chat_id": str(chat_id),
+            "text": _approval_message(request, timeout_s),
+            "reply_markup": _approval_keyboard(rid, digest, allowed),
+        }
+        if thread_id:
+            kwargs["message_thread_id"] = thread_id
+
+        # Register waiter + map BEFORE sending: once the buttons exist every
+        # tap finds a live entry; a failed send drops both in ``finally``.
+        entry: Dict[str, Any] = {
+            "digest": digest, "allowed": [c for c in allowed],
+            "chat_id": str(chat_id), "thread_id": thread_id,
+            "message_id": None, "expires": time.time() + timeout_s,
+        }
+        waiter: Dict[str, Any] = {
+            "event": threading.Event(), "request": request, "choice": None}
+        with _CWD_LOCK:
+            state = _load_state()
+            state.setdefault(_APPROVALS_KEY, {})[rid] = entry
+            _save_state(state)
+        _APPROVAL_WAITERS[rid] = waiter
+        try:
+            message = _tg_send_sync(kwargs, wait_s=min(15.0, timeout_s))
+            if message is None:
+                return request.respond("deny")
+            message_id = getattr(message, "message_id", None)
+            if message_id is not None:
+                with _CWD_LOCK:
+                    state = _load_state()
+                    live = (state.get(_APPROVALS_KEY) or {}).get(rid)
+                    if isinstance(live, dict):
+                        live["message_id"] = message_id
+                        _save_state(state)
+
+            remaining = deadline - time.monotonic()
+            if remaining > 0 and waiter["event"].wait(remaining) \
+                    and waiter.get("choice"):
+                return request.respond(str(waiter["choice"]))
+            # No (valid) tap before the deadline: withdraw the prompt and
+            # fail closed — the host also denies on its own timeout.
+            _tg_edit_best_effort(
+                chat_id, message_id,
+                "⌛️ Время истекло — команда отклонена (fail-closed).")
+            return request.respond("deny")
+        finally:
+            _APPROVAL_WAITERS.pop(rid, None)
+            _approval_drop(rid)
+    except Exception:
+        logger.warning("tg-projects: approval transport failed", exc_info=True)
+        try:
+            return request.respond("deny")
+        except Exception:
+            return None
+
+
+async def _handle_approval_callback(query: Any, m) -> None:
+    """Resolve one ``tgp:a:<choice>:<rid>:<digest8>`` tap.
+
+    Validates against approvals_map (live request, digest prefix match, not
+    expired, choice allowed) before waking the waiter. Anything stale or
+    mismatched is answered in place and never resolves the request.
+    """
+    choice, rid, digest8 = m.group(1), m.group(2), m.group(3)
+    entry = None
+    try:
+        with _CWD_LOCK:
+            amap = _load_state().get(_APPROVALS_KEY) or {}
+            raw = amap.get(rid)
+            entry = dict(raw) if isinstance(raw, dict) else None
+    except Exception:
+        entry = None
+
+    if entry is None:
+        with _suppress(Exception):
+            await query.edit_message_text(
+                "⚠️ Запрос устарел, уже отвечен или перезапущен — "
+                "команда отклонена.")
+        with _suppress(Exception):
+            await query.answer()
+        return
+
+    digest = str(entry.get("digest") or "")
+    if not digest.startswith(str(digest8 or "")):
+        # The tap does not bind to this exact request (replayed/forwarded
+        # button): refuse without resolving anything.
+        with _suppress(Exception):
+            await query.answer("⚠️ Кнопка не совпадает с запросом — "
+                               "ответ не принят.")
+        return
+    if float(entry.get("expires") or 0) < time.time():
+        _approval_drop(rid)
+        with _suppress(Exception):
+            await query.edit_message_text(
+                "⌛️ Время истекло — команда отклонена (fail-closed).")
+        with _suppress(Exception):
+            await query.answer()
+        return
+    if choice not in (entry.get("allowed") or ()):
+        with _suppress(Exception):
+            await query.answer("⚠️ Этот выбор недоступен для данного запроса.")
+        return
+    waiter = _APPROVAL_WAITERS.get(rid)
+    if waiter is None:
+        _approval_drop(rid)
+        with _suppress(Exception):
+            await query.edit_message_text(
+                "⚠️ Запрос уже закрыт — команда отклонена.")
+        with _suppress(Exception):
+            await query.answer()
+        return
+
+    waiter["choice"] = choice
+    waiter["event"].set()
+    with _suppress(Exception):
+        await query.edit_message_text(_APPROVAL_CHOICE_TEXT.get(choice, choice))
+    with _suppress(Exception):
+        await query.answer()
+
+
+# ------------------------------------------------------------------ project wizard
+# /menu → [📁 Проект] → [➕ Новый] (tgp:pw:start) opens a two-step dialog:
+# "Название проекта?" → free text → "Путь к каталогу (абсолютный)?" → free
+# text → hermes_cli.projects_db.create_project. Free-text answers are
+# captured by the ``pre_gateway_dispatch`` hook BEFORE dispatch — it returns
+# {"action": "skip"} (gateway/run_inbound.py drops the event), so a dialog
+# answer NEVER becomes an LLM turn. The hook is registered BEFORE the sync
+# hook; it returns None while no live wizard state exists, so seamless sync
+# still runs for everyone else.
+#
+# State: state.json["wizard"]["<chat_id>:<thread_id>"] = {"step", "name",
+# "project_id", "updated_at"} (+ "user_id" — the auth-gated button tapper;
+# the hook runs BEFORE gateway auth, so the sender is matched against it).
+# A state older than WIZARD_TTL_S is ignored, NOT deleted (the text goes to
+# the session as usual). [❌ Отмена] (tgp:pw:cancel) and the /menu handler
+# (via _wizard_reset_chat) drop it explicitly. Every wizard message is a
+# fresh send_message into the same chat/topic — no edits, the dialog is
+# alive. After success the user gets [📂 Выбрать проект] (tgp:pb:proj —
+# the panel callback). Topic bindings are NEVER set implicitly here:
+# binding stays an explicit action.
+WIZARD_TTL_S = 600
+_WIZARD_NAME_MAX = 100
+_WIZARD_START_CB = "tgp:pw:start"
+_WIZARD_CANCEL_CB = "tgp:pw:cancel"
+_WIZARD_SELECT_CB = "tgp:pb:proj"
+# A command-looking token (``/menu``, ``/stop``) passes through so the user
+# can always reset/abort via commands — but a PATH answer also starts with
+# "/", so only slash-free single tokens count as commands (``/mnt/disk/x``
+# is an answer, ``/stop`` is a command; ``/home`` alone is an accepted miss).
+_WIZARD_CMD_RE = re.compile(r"^/[^/\s]+$")
+
+# Cyrillic → latin transliteration for slug candidates. The core's
+# projects_db._slugify strips every non-[a-z0-9] char, so a Cyrillic name
+# would collapse to "project" — the wizard derives the slug itself and
+# passes it to create_project (which still normalizes + uniquifies).
+_WIZARD_TRANSLIT = {
+    "а": "a", "б": "b", "в": "v", "г": "g", "д": "d", "е": "e", "ё": "e",
+    "ж": "zh", "з": "z", "и": "i", "й": "y", "к": "k", "л": "l", "м": "m",
+    "н": "n", "о": "o", "п": "p", "р": "r", "с": "s", "т": "t", "у": "u",
+    "ф": "f", "х": "h", "ц": "c", "ч": "ch", "ш": "sh", "щ": "sch", "ъ": "",
+    "ы": "y", "ь": "", "э": "e", "ю": "yu", "я": "ya",
+}
+
+
+def _wizard_slug(name: str) -> str:
+    """Transliterate *name* into a projects.db slug candidate.
+
+    Per-char transliteration, lowercase, non-alphanumerics collapsed to
+    "-", capped at 64 chars, never empty ("project" fallback).
+    """
+    s = str(name or "").strip().lower()
+    s = "".join(_WIZARD_TRANSLIT.get(ch, ch) for ch in s)
+    s = re.sub(r"[^a-z0-9]+", "-", s).strip("-_")
+    return s[:64].strip("-_") or "project"
+
+
+def _wizard_key(chat_id, thread_id) -> str:
+    """The state.json["wizard"] key: ``<chat_id>:<thread_id>`` ('' = no topic)."""
+    return f"{str(chat_id or '').strip()}:{str(thread_id or '').strip()}"
+
+
+def _wizard_get(key: str) -> Optional[Dict[str, Any]]:
+    """A copy of the chat's wizard state, or None when absent."""
+    try:
+        entry = (_load_state().get("wizard") or {}).get(key)
+    except Exception:
+        return None
+    return dict(entry) if isinstance(entry, dict) else None
+
+
+def _wizard_put(key: str, entry: Dict[str, Any]) -> None:
+    with _CWD_LOCK:
+        state = _load_state()
+        state.setdefault("wizard", {})[key] = entry
+        _save_state(state)
+
+
+def _wizard_pop(key: str) -> None:
+    with _CWD_LOCK:
+        state = _load_state()
+        wizard = state.get("wizard") or {}
+        if key in wizard:
+            wizard.pop(key, None)
+            if not wizard:
+                state.pop("wizard", None)
+            _save_state(state)
+
+
+def _wizard_reset_chat(chat_id, thread_id: Any = None) -> None:
+    """Drop the chat's wizard state (every topic of that chat).
+
+    The /menu handler calls this so a freshly opened menu never resumes a
+    half-finished dialog. ``thread_id`` is accepted for call-site symmetry
+    and ignored — the reset covers all the chat's topics.
+    """
+    cid = str(chat_id or "").strip()
+    if not cid:
+        return
+    with _CWD_LOCK:
+        state = _load_state()
+        wizard = state.get("wizard") or {}
+        dead = [k for k in wizard if str(k).split(":", 1)[0] == cid]
+        for k in dead:
+            wizard.pop(k, None)
+        if dead:
+            if not wizard:
+                state.pop("wizard", None)
+            _save_state(state)
+
+
+def _wizard_cancel_keyboard():
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton("❌ Отмена", callback_data=_WIZARD_CANCEL_CB)]])
+
+
+def _wizard_done_keyboard():
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton("📂 Выбрать проект", callback_data=_WIZARD_SELECT_CB)]])
+
+
+async def _wizard_send(chat_id: str, thread_id: str, text: str, keyboard=None) -> bool:
+    """Send a wizard message into its chat/topic; never raises.
+
+    Prefers the wired PTB bot (inline keyboards ride along), degrades to the
+    adapter's plain send, then to a log line. The thread-id convention
+    matches the /projects keyboard (int when numeric).
+    """
+    chat_id = str(chat_id or "").strip()
+    if not chat_id:
+        return False
+    thread_id = str(thread_id or "").strip()
+    thread_kwargs: Dict[str, Any] = {}
+    if thread_id:
+        thread_kwargs["message_thread_id"] = int(thread_id) if thread_id.isdigit() else thread_id
+    bot = getattr(_NATIVE, "bot", None) if _NATIVE is not None else None
+    if bot is not None:
+        try:
+            kwargs: Dict[str, Any] = {"chat_id": chat_id, "text": text}
+            if keyboard is not None:
+                kwargs["reply_markup"] = keyboard
+            await bot.send_message(**{**kwargs, **thread_kwargs})
+            return True
+        except Exception:
+            logger.warning("tg-projects wizard: bot send failed, trying adapter", exc_info=True)
+    if _ADAPTER is not None:
+        try:
+            await _ADAPTER.send(chat_id, text,
+                                metadata={"thread_id": thread_id} if thread_id else None)
+            return True
+        except Exception:
+            logger.warning("tg-projects wizard: adapter send failed", exc_info=True)
+    return False
+
+
+def _wizard_validate_name(name: str) -> Optional[str]:
+    """Error text for a bad project name, or None when valid."""
+    name = str(name or "").strip()
+    if not name:
+        return "❌ Название не может быть пустым — пришлите название ещё раз."
+    if len(name) > _WIZARD_NAME_MAX:
+        return (f"❌ Название длиннее {_WIZARD_NAME_MAX} символов ({len(name)}). "
+                "Сократите и пришлите ещё раз.")
+    return None
+
+
+def _wizard_path_error(name: str, path: str) -> Optional[str]:
+    """Error text for a bad path (shape, existence, duplicates), or None.
+
+    Both duplicate kinds are checked against projects.db up front: the slug
+    the wizard would generate and the primary_path itself (the same check
+    create_project applies via find_by_primary_path — checked first here so
+    the user gets a readable message instead of a raised ValueError).
+    """
+    path = str(path or "").strip()
+    if not path.startswith("/"):
+        return f"❌ Путь «{path}» не абсолютный — нужен путь от корня, например /mnt/mydisk/sd2."
+    if not os.path.isdir(path):
+        return (f"❌ Каталог {path} не существует. Мастер не создаёт каталоги — "
+                "укажите существующий абсолютный путь.")
+    slug = _wizard_slug(name)
+    try:
+        projects_db = _import_hermes_module("hermes_cli.projects_db")
+        with projects_db.connect_closing() as conn:
+            for proj in projects_db.list_projects(conn, include_archived=True):
+                if getattr(proj, "slug", None) == slug:
+                    return (f"❌ Slug «{slug}» уже занят проектом "
+                            f"«{getattr(proj, 'name', '?')}». Придумайте другое название.")
+            existing = projects_db.find_by_primary_path(conn, path)
+            if existing is not None:
+                return (f"❌ Каталог {path} уже принадлежит проекту "
+                        f"«{getattr(existing, 'name', '?')}» [{getattr(existing, 'slug', '')}]. "
+                        "Переключитесь на него вместо создания дубликата.")
+    except Exception as exc:
+        return f"❌ Не удалось проверить projects.db: {exc}. Пришлите путь ещё раз."
+    return None
+
+
+def _wizard_create(name: str, path: str) -> tuple:
+    """``(project_id, slug, error_text)`` — success or failure, never raises."""
+    slug = _wizard_slug(name)
+    try:
+        projects_db = _import_hermes_module("hermes_cli.projects_db")
+        with projects_db.connect_closing() as conn:
+            pid = projects_db.create_project(conn, name=name, slug=slug, primary_path=path)
+        return pid, slug, None
+    except ValueError as exc:
+        return None, slug, f"❌ projects.db: {exc}"
+    except Exception as exc:
+        return None, slug, f"❌ Не удалось создать проект: {exc}"
+
+
+async def _wizard_on_button(query: Any, data: str) -> None:
+    """``tgp:pw:*`` button taps: start the dialog or cancel it.
+
+    Auth already happened in _tg_on_button (the same _callback_authorized
+    gate as every other project button). The tapping user's id is recorded
+    in the state so the dispatch hook only accepts THAT sender's free text.
+    """
+    msg = getattr(query, "message", None)
+    chat = getattr(msg, "chat", None) if msg is not None else None
+    chat_id = str(getattr(chat, "id", "") or "")
+    raw_thread = getattr(msg, "message_thread_id", None) if msg is not None else None
+    thread_id = str(raw_thread) if raw_thread is not None else ""
+    user_id = str(getattr(getattr(query, "from_user", None), "id", "") or "")
+    key = _wizard_key(chat_id, thread_id)
+
+    if data == _WIZARD_START_CB:
+        _wizard_put(key, {
+            "step": "name",
+            "name": None,
+            "project_id": None,
+            "user_id": user_id,
+            "updated_at": int(time.time()),
+        })
+        await _wizard_send(chat_id, thread_id, "Название проекта?",
+                           keyboard=_wizard_cancel_keyboard())
+        with _suppress(Exception):
+            await query.answer()
+        return
+
+    if data == _WIZARD_CANCEL_CB:
+        _wizard_pop(key)
+        await _wizard_send(chat_id, thread_id,
+                           "❌ Создание проекта отменено. /menu → 📁 Проект, чтобы начать заново.")
+        with _suppress(Exception):
+            await query.answer()
+        return
+
+    with _suppress(Exception):
+        await query.answer()  # unknown tgp:pw: payload — acknowledge, ignore
+
+
+async def _on_wizard_pre_gateway_dispatch(event: Any, gateway: Any = None,
+                                          session_store: Any = None,
+                                          **kwargs) -> Optional[Dict[str, Any]]:
+    """``pre_gateway_dispatch`` — the project-wizard free-text gate.
+
+    Returns ``{"action": "skip", "reason": "project_wizard"}`` ONLY when the
+    text was consumed as a dialog answer; None otherwise (fail-open — the
+    sync hook and normal dispatch still run). Registered BEFORE the sync
+    hook: a live wizard owns the lane's free text. The hook runs
+    BEFORE gateway auth, so the sender is matched against the user id that
+    started the wizard via an auth-gated button tap; anyone else's text
+    passes through untouched.
+    """
+    try:
+        return await _wizard_hook_impl(event)
+    except Exception:
+        logger.warning("tg-projects wizard: pre_gateway_dispatch failed", exc_info=True)
+        return None
+
+
+async def _wizard_hook_impl(event: Any) -> Optional[Dict[str, Any]]:
+    source = getattr(event, "source", None)
+    if source is None:
+        return None
+    if str(getattr(getattr(source, "platform", None), "value", "") or "") != "telegram":
+        return None
+    if bool(getattr(event, "internal", False)):
+        return None  # synthetic re-dispatches never feed the wizard
+    text = str(getattr(event, "text", "") or "").strip()
+    if not text or _WIZARD_CMD_RE.match(text):
+        return None  # commands flow through (auth, /menu, /stop keep working)
+    chat_id = str(getattr(source, "chat_id", "") or "").strip()
+    if not chat_id:
+        return None
+    thread_id = str(getattr(source, "thread_id", "") or "").strip()
+    key = _wizard_key(chat_id, thread_id)
+    entry = _wizard_get(key)
+    if entry is None:
+        return None
+    if int(entry.get("updated_at") or 0) + WIZARD_TTL_S < time.time():
+        return None  # stale dialog: the text goes to the session as usual
+    wizard_user = str(entry.get("user_id") or "").strip()
+    sender = str(getattr(source, "user_id", "") or "").strip()
+    if wizard_user and sender and wizard_user != sender:
+        return None  # a different sender's text is not a dialog answer
+
+    step = str(entry.get("step") or "").strip()
+
+    if step == "name":
+        name = text
+        err = _wizard_validate_name(name)
+        if err is not None:
+            entry["updated_at"] = int(time.time())
+            _wizard_put(key, entry)
+            await _wizard_send(chat_id, thread_id,
+                               f"{err}\n\nНазвание проекта?",
+                               keyboard=_wizard_cancel_keyboard())
+            return {"action": "skip", "reason": "project_wizard"}
+        entry["name"] = name
+        entry["step"] = "path"
+        entry["updated_at"] = int(time.time())
+        _wizard_put(key, entry)
+        await _wizard_send(chat_id, thread_id,
+                           f"✓ Название: {name}\n\nПуть к каталогу (абсолютный)?",
+                           keyboard=_wizard_cancel_keyboard())
+        return {"action": "skip", "reason": "project_wizard"}
+
+    if step == "path":
+        name = str(entry.get("name") or "").strip()
+        path = text.strip().strip('"')
+        err = _wizard_validate_name(name)
+        if err is None:
+            err = _wizard_path_error(name, path)
+        if err is None:
+            pid, slug, err = _wizard_create(name, path)
+        if err is not None:
+            entry["updated_at"] = int(time.time())
+            _wizard_put(key, entry)
+            await _wizard_send(chat_id, thread_id,
+                               f"{err}\n\nПуть к каталогу (абсолютный)?",
+                               keyboard=_wizard_cancel_keyboard())
+            return {"action": "skip", "reason": "project_wizard"}
+        _wizard_pop(key)
+        await _wizard_send(chat_id, thread_id,
+                           f"✅ Проект создан: {name} ({slug}, {path})",
+                           keyboard=_wizard_done_keyboard())
+        return {"action": "skip", "reason": "project_wizard"}
+
+    _wizard_pop(key)  # corrupt step — heal by dropping the state, fail open
+    return None
 
 
 # ------------------------------------------------------------------------ register
@@ -2079,20 +3604,49 @@ def register(ctx) -> None:
         description="Создать новый проект + топик (имя, путь, new-folder — создать каталог)",
         args_hint="<название> <абсолютный путь> [new-folder]",
     )
+    ctx.register_command(
+        "menu",
+        handler=_menu_command,
+        description="Панель топика — закреплённое сообщение с кнопками",
+        args_hint="",
+    )
     ctx.register_hook("on_session_start", _on_session_start)
     # Fallback for sessions on_session_start never sees (a topic's first
     # session without a pin, /resume'd sessions): applies the topic->project
     # cwd on the first turn instead. Idempotent via _CWD_APPLIED.
     ctx.register_hook("pre_llm_call", _on_pre_llm_call)
-    # Cross-device continuity: park a message that arrives while the session
-    # is busy on the desktop and ask Yes/No (handoff.py). Fail-open.
+    # Lazy prune of stale topic bindings/panels at start; never fatal.
     try:
-        _handoff = _import_handoff()
-        ctx.register_hook("pre_gateway_dispatch", _handoff.on_pre_gateway_dispatch)
-        logger.info("tg-projects: pre_gateway_dispatch handoff hook registered")
+        _prune_stale_state()
     except Exception:
-        logger.warning("tg-projects: handoff hook registration failed; "
-                       "cross-device prompts disabled", exc_info=True)
+        logger.warning("tg-projects: startup state prune failed", exc_info=True)
+    # Project wizard (/menu → [➕ Новый]): consumes free-text answers via
+    # pre_gateway_dispatch BEFORE the text reaches the session. Registered
+    # BEFORE the sync hook so a live wizard owns the lane's free text;
+    # returns None while inactive, so seamless sync still runs.
+    try:
+        ctx.register_hook("pre_gateway_dispatch", _on_wizard_pre_gateway_dispatch)
+        logger.info("tg-projects: wizard pre_gateway_dispatch hook registered")
+    except Exception:
+        logger.warning("tg-projects: wizard hook registration failed", exc_info=True)
+    # Seamless topic sync: free text in a bound topic follows the binding's
+    # session (switch on drift); unbound topics get a "choose a project"
+    # reply + the topic panel. Never blocks a bound topic's message.
+    try:
+        ctx.register_hook("pre_gateway_dispatch", _on_pre_gateway_dispatch_sync)
+        logger.info("tg-projects: pre_gateway_dispatch sync hook registered")
+    except Exception:
+        logger.warning("tg-projects: sync hook registration failed; "
+                       "topic routing falls back to the core heal", exc_info=True)
+    # Human approval transport (tg-topics): dangerous-command prompts as
+    # Telegram inline buttons. Inactive until security.approval.transport:
+    # tg-topics selects it in config.yaml; fail-closed by contract.
+    try:
+        ctx.register_approval_transport("tg-topics", _approval_present)
+        logger.info("tg-projects: approval transport registered (tg-topics)")
+    except Exception:
+        logger.warning("tg-projects: approval transport registration failed",
+                       exc_info=True)
     try:
         ctx.register_platform_handler("telegram", _telegram_wire)
     except Exception:

@@ -1,33 +1,26 @@
 """tg-projects — cross-device session handoff (Telegram ↔ desktop).
 
-The Telegram gateway and the desktop app are SEPARATE processes (the desktop
-spawns its own ``hermes serve`` backend). The only state they share is
-``~/.hermes/state.db``. Two mechanisms bridge the gap:
+RETIRED (2026-10): the Yes/No handoff gate is gone from production. The
+``pre_gateway_dispatch`` hook is a pure passthrough — it ALWAYS returns
+None (allow), never parks a message, never sends a prompt, never touches
+state.json. Seamless sync replaces the question: a Telegram message for a
+session that is busy on the desktop flows into dispatch, and the
+``session_turn_leases`` write fence (state.db, core-owned) serializes the
+two processes per session id exactly as it does for any follow-up.
 
-* ``session_turn_leases`` (state.db, core-owned) — a cross-process write fence
-  taken for every running turn. The holder string carries the platform
-  (``pid=<pid>:turn=<id>:<...>:platform=desktop|telegram|subagent``), so a
-  FRESH lease held by a foreign platform means "a turn is running on the
-  other device right now".
-* ``device_sessions`` claims (plugin-owned sqlite) — conversational ownership
-  label for the menus ("📱 активна с телефона").
+Everything below the hook is kept as dead legacy code for the
+``tgp:ho:*`` callback consumers (an old keyboard may still tap once);
+no production path calls it:
 
-Handoff flow (user writes from Telegram while the desktop turn runs):
-1. ``pre_gateway_dispatch`` sees a fresh foreign lease → stores the message
-   as *pending* in state.json, sends a Yes/No prompt, returns skip.
-2. "Yes" (callback ``tgp:ho:<session_id>:y``):
-   - steal the foreign lease (DELETE the row; the desktop turn's next
-     transcript write raises SessionTurnLeaseLostError and the turn dies —
-     this is the only cross-process stop available without an RPC);
-   - claim the session for telegram (device_sessions);
-   - point this chat's lane at the session via
-     ``SessionStore.switch_session`` (CAS-safe);
-   - append a handoff event for the desktop notifier;
-   - re-dispatch the pending message as a normal gateway turn.
-3. "No" drops the pending message; nothing else changes.
+* ``session_turn_leases`` inspection helpers (``foreign_running_lease``,
+  ``steal_lease``) — the cross-process lease table is still the shared
+  truth, but nothing here acts on it anymore.
+* ``handoff_tokens`` / ``handoff_pending`` state.json buckets — legacy;
+  nothing writes them, ``consume_token``/``pop_pending`` therefore always
+  answer "stale" for pre-retirement leftovers.
+* ``device_sessions`` claims — conversational ownership label only.
 
-Every helper fails OPEN: any error in ownership/lease logic lets the message
-through unchanged — the handoff UX must never break normal chatting.
+Every helper fails OPEN: any error lets the message through unchanged.
 """
 
 from __future__ import annotations
@@ -343,24 +336,14 @@ def notify_desktop_handoff(session_id: str, from_device: str, to_device: str,
 
 
 # ------------------------------------------------------------------- the hook
-def should_prompt(state_conn, session_id: str, current_device: str = "telegram"
-                  ) -> Optional[Dict[str, Any]]:
-    """The decision core: prompt when a foreign RUNNING lease exists.
+async def on_pre_gateway_dispatch(event, gateway, session_store=None, **kwargs):
+    """``pre_gateway_dispatch`` hook — retired, a pure passthrough.
 
-    Kept separate from the hook so tests drive it without an event loop.
-    """
-    if str(current_device or "").strip().lower() != "telegram":
-        return None  # v1: the hook only serves the Telegram side
-    return foreign_running_lease(state_conn, session_id)
-
-
-async def on_pre_gateway_dispatch(event, gateway, session_store, **kwargs):
-    """``pre_gateway_dispatch`` hook — the busy-on-another-device gate.
-
-    Returns ``{"action": "skip"}`` ONLY when the message was parked behind a
-    Yes/No prompt; every other path returns None (allow) — fail-open.
-    Commands pass through untouched (the user must be able to /stop or /new
-    even while the desktop is busy).
+    ALWAYS returns None (allow): no parking, no Yes/No prompt, no lease
+    inspection, no state.json writes. A message that arrives while the same
+    session runs on the desktop is dispatched normally; the core's
+    per-session-id turn lease serializes the two processes. Fail-open on
+    any internal error so the gateway never sees an exception.
     """
     try:
         return await _hook_impl(event, gateway, session_store)
@@ -370,58 +353,21 @@ async def on_pre_gateway_dispatch(event, gateway, session_store, **kwargs):
 
 
 async def _hook_impl(event, gateway, session_store):
-    source = getattr(event, "source", None)
-    if source is None:
-        return None
-    if str(getattr(getattr(source, "platform", None), "value", "") or "") != "telegram":
-        return None
-    if bool(getattr(event, "internal", False)):
-        return None  # synthetic re-dispatches must never re-prompt
-    text = str(getattr(event, "text", "") or "").strip()
-    if not text or text.startswith("/"):
-        return None  # commands flow through the normal (interrupt-capable) path
-    if str(getattr(source, "chat_type", "") or "") != "dm":
-        return None  # group lanes: keep current behavior
+    """Seamless-sync stub: log the entry, then let the message through.
 
-    session_id = _resolve_lane_session_id(gateway, session_store, source)
-    if not session_id:
-        return None
-
-    conn = _open_ro()
-    try:
-        lease = should_prompt(conn, session_id) if conn is not None else None
-    finally:
-        if conn is not None:
-            try:
-                conn.close()
-            except sqlite3.Error:
-                pass
-    if lease is None:
-        # Idle (or ours): mark phone-side ownership and let the turn run.
-        device_sessions.claim(session_id, "telegram",
-                              surface=str(getattr(source, "chat_id", "") or ""))
-        return None
-
-    # Busy on another device: park the message and ask for confirmation.
-    sk = _generate_session_key(gateway, source)
-    if not sk:
-        return None  # cannot key the pending message — fail-open
-    stored = store_pending(sk, session_id, text, {
-        "chat_id": getattr(source, "chat_id", ""),
-        "thread_id": getattr(source, "thread_id", "") or "",
-        "user_id": getattr(source, "user_id", "") or "",
-        "user_name": getattr(source, "user_name", "") or "",
-        "message_id": str(getattr(event, "message_id", "") or ""),
-    })
-    if not stored:
-        return None  # state.json unwritable — fail-open
-    sent = await _send_prompt(source, session_id, sk, lease)
-    if not sent:
-        logger.error(
-            "tg-projects handoff: prompt undeliverable for session %s — message "
-            "parked in state.json but the user got no buttons; they must wait "
-            "for the other device to finish or /stop.", session_id)
-    return {"action": "skip", "reason": "busy_elsewhere"}
+    The body is deliberately free of every side effect the old gate had:
+    no ``store_pending``, no ``register_token``, no ``_send_prompt``, no
+    ``device_sessions.claim`` — a busy-on-another-device session and a
+    parallel desktop write are both just ordinary inbound traffic now.
+    """
+    logger.debug(
+        "tg-projects handoff: pre_gateway_dispatch passthrough (platform=%s chat=%s internal=%s)",
+        str(getattr(getattr(getattr(event, "source", None), "platform", None), "value", "")
+            or "?"),
+        str(getattr(getattr(event, "source", None), "chat_id", "") or "?"),
+        bool(getattr(event, "internal", False)),
+    )
+    return None
 
 
 def _resolve_lane_session_id(gateway, session_store, source) -> str:

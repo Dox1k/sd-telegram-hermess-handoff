@@ -1,9 +1,15 @@
-"""Unit tests for tg-projects handoff (cross-device session switching).
+"""Unit tests for tg-projects handoff (retired cross-device gate).
 
 Run:  python3 /home/meow/.hermes/plugins/tg-projects/test_handoff.py
 No network, no Telegram, no getUpdates, no writes to the real state.db —
 state.json is stubbed and the lease helpers are tested against temp sqlite
 files that mimic the session_turn_leases table.
+
+The production contract under test (HookPassThroughTests): the
+``pre_gateway_dispatch`` hook ALWAYS returns None — a Telegram message is
+dispatched even while the same session runs on the PC, with no Yes/No
+question, no parked message, no token. The remaining classes cover the
+dead legacy helpers kept for old ``tgp:ho:*`` keyboards.
 """
 import asyncio
 import importlib.util
@@ -112,12 +118,6 @@ class ForeignLeaseTests(unittest.TestCase):
     def test_missing_table_returns_none(self):
         conn = sqlite3.connect(":memory:")
         self.assertIsNone(handoff.foreign_running_lease(conn, "s1"))
-        conn.close()
-
-    def test_should_prompt_only_for_telegram_side(self):
-        conn = self._conn([("s1", "pid=1:platform=desktop", time.time() + 120)])
-        self.assertIsNotNone(handoff.should_prompt(conn, "s1", "telegram"))
-        self.assertIsNone(handoff.should_prompt(conn, "s1", "desktop"))
         conn.close()
 
 
@@ -328,19 +328,30 @@ class TokenManagementTests(unittest.TestCase):
         self.assertNotIn("handoff_tokens", self._t.state())
 
 
-class HookFailOpenTests(unittest.TestCase):
-    """on_pre_gateway_dispatch must never raise into the gateway."""
+class HookPassThroughTests(unittest.TestCase):
+    """on_pre_gateway_dispatch is a retired passthrough: it must return None
+    (allow) for EVERY input, create no tokens/prompts/pending state, and
+    never block or rewrite the dispatch of the incoming message."""
 
     def setUp(self):
         self._t = _TempHome()
+        # Sentinels: any attempt to send a prompt or touch the native bot
+        # fails the test (the retired hook must not ask questions).
+        self._native_calls = []
+        self._saved_get_native = handoff._get_native
+        self._saved_get_adapter = handoff._get_adapter
+        handoff._get_native = lambda: self._native_calls.append(1) or None
+        handoff._get_adapter = lambda: self._native_calls.append(1) or None
 
     def tearDown(self):
+        handoff._get_native = self._saved_get_native
+        handoff._get_adapter = self._saved_get_adapter
         self._t.restore()
 
     def _event(self, text="hi", platform="telegram", chat_type="dm", internal=False):
         src = types.SimpleNamespace(
             platform=types.SimpleNamespace(value=platform),
-            chat_id="5", thread_id="", user_id="7", chat_type=chat_type)
+            chat_id="5", thread_id="17", user_id="7", chat_type=chat_type)
         return types.SimpleNamespace(source=src, text=text, internal=internal, message_id="1")
 
     def _gateway(self, session_id="s1"):
@@ -348,51 +359,144 @@ class HookFailOpenTests(unittest.TestCase):
             lookup_by_session_key=lambda sk: types.SimpleNamespace(session_id=session_id))
         return types.SimpleNamespace(
             session_store=store,
-            _generate_session_key=lambda src: "sk-lane",
+            _generate_session_key=lambda src: "tg:telegram:dm:5:17",
             async_session_store=None)
+
+    def _run(self, event, gateway, store=None):
+        return asyncio.run(handoff.on_pre_gateway_dispatch(event, gateway, store))
+
+    def _assert_no_handoff_state(self):
+        state = self._t.state()
+        self.assertNotIn("handoff_pending", state)
+        self.assertNotIn("handoff_tokens", state)
+        self.assertFalse(handoff._EVENTS_FILE.exists())
+        self.assertEqual(self._native_calls, [])
+
+    def _assert_message_dispatched(self, event, result):
+        # None = normal dispatch in the core (run_inbound._hm_pre_gateway_dispatch_hook);
+        # a "skip" dict would DROP the message, a "rewrite" would replace its text.
+        self.assertIsNone(result)
+        self.assertEqual(event.text, getattr(event, "text", ""))
+
+    # (a) the hook returns None for every input --------------------------------
 
     def test_idle_message_flows_through(self):
-        # no leases table at all → no foreign lease → allow (None)
-        result = asyncio.run(handoff.on_pre_gateway_dispatch(
-            self._event(), self._gateway(), None))
-        self.assertIsNone(result)
+        # no leases table at all — nothing to be busy with
+        event = self._event(text="привет")
+        result = self._run(event, self._gateway())
+        self._assert_message_dispatched(event, result)
+        self._assert_no_handoff_state()
 
-    def test_command_not_intercepted(self):
-        result = asyncio.run(handoff.on_pre_gateway_dispatch(
-            self._event(text="/stop"), self._gateway(), None))
-        self.assertIsNone(result)
-
-    def test_non_telegram_ignored(self):
-        result = asyncio.run(handoff.on_pre_gateway_dispatch(
-            self._event(platform="discord"), self._gateway(), None))
-        self.assertIsNone(result)
-
-    def test_internal_redispatch_ignored(self):
-        result = asyncio.run(handoff.on_pre_gateway_dispatch(
-            self._event(internal=True), self._gateway(), None))
-        self.assertIsNone(result)
-
-    def test_group_chat_ignored(self):
-        result = asyncio.run(handoff.on_pre_gateway_dispatch(
-            self._event(chat_type="group"), self._gateway(), None))
-        self.assertIsNone(result)
-
-    def test_busy_prompts_and_skips(self):
+    def test_parallel_desktop_write_flows_through(self):
+        # a FRESH desktop-platform lease: the PC is writing this session
+        # right now. Old behavior parked + asked; now the message must go.
         conn = _lease_db(self._t.home / "state.db",
                          [("s1", "pid=1:platform=desktop", time.time() + 300)])
-        store = types.SimpleNamespace(
-            lookup_by_session_key=lambda sk: types.SimpleNamespace(session_id="s1"))
-        gateway = types.SimpleNamespace(
-            session_store=store, _generate_session_key=lambda src: "sk-lane",
-            async_session_store=None)
-        # native/adapter unavailable → prompt send fails silently, hook still skips
-        result = asyncio.run(handoff.on_pre_gateway_dispatch(
-            self._event(), gateway, store))
-        self.assertEqual(result, {"action": "skip", "reason": "busy_elsewhere"})
-        # pending message stored
-        entry = handoff.pop_pending("sk-lane")
-        self.assertEqual(entry["text"], "hi")
         conn.close()
+        event = self._event(text="продолжай без вопросов")
+        result = self._run(event, self._gateway())
+        self._assert_message_dispatched(event, result)
+        self._assert_no_handoff_state()
+
+    def test_message_during_busy_telegram_session_flows_through(self):
+        # our own surface's lease (a TG turn is running): still just allow
+        conn = _lease_db(self._t.home / "state.db",
+                         [("s1", "pid=1:platform=telegram", time.time() + 300)])
+        conn.close()
+        event = self._event()
+        result = self._run(event, self._gateway())
+        self._assert_message_dispatched(event, result)
+        self._assert_no_handoff_state()
+
+    def test_subagent_lease_flows_through(self):
+        conn = _lease_db(self._t.home / "state.db",
+                         [("s1", "pid=1:turn=x:platform=subagent", time.time() + 300)])
+        conn.close()
+        self.assertIsNone(self._run(self._event(), self._gateway()))
+
+    def test_command_not_intercepted(self):
+        event = self._event(text="/stop")
+        result = self._run(event, self._gateway())
+        self._assert_message_dispatched(event, result)
+        self._assert_no_handoff_state()
+
+    def test_non_telegram_source_flows_through(self):
+        for platform in ("discord", "desktop", "slack"):
+            event = self._event(text="hi", platform=platform)
+            result = self._run(event, self._gateway())
+            self._assert_message_dispatched(event, result)
+        self._assert_no_handoff_state()
+
+    def test_internal_redispatch_flows_through(self):
+        event = self._event(internal=True)
+        result = self._run(event, self._gateway())
+        self._assert_message_dispatched(event, result)
+        self._assert_no_handoff_state()
+
+    def test_group_chat_flows_through(self):
+        event = self._event(text="в топике", chat_type="group")
+        result = self._run(event, self._gateway())
+        self._assert_message_dispatched(event, result)
+        self._assert_no_handoff_state()
+
+    def test_empty_text_flows_through(self):
+        event = self._event(text="   ")
+        result = self._run(event, self._gateway())
+        self._assert_message_dispatched(event, result)
+
+    def test_unresolvable_lane_flows_through(self):
+        # gateway stub without a session-key generator (lane unknown)
+        gateway = types.SimpleNamespace(session_store=None, async_session_store=None)
+        event = self._event()
+        result = self._run(event, gateway)
+        self._assert_message_dispatched(event, result)
+        self._assert_no_handoff_state()
+
+    def test_missing_source_flows_through(self):
+        event = types.SimpleNamespace(text="hi", internal=False)
+        result = self._run(event, self._gateway())
+        self.assertIsNone(result)
+
+    def test_no_store_passed_flows_through(self):
+        event = self._event()
+        result = self._run(event, self._gateway(), None)
+        self._assert_message_dispatched(event, result)
+
+    # (b) no tokens / questions / parked messages are created ------------------
+
+    def test_no_token_registered_for_busy_session(self):
+        conn = _lease_db(self._t.home / "state.db",
+                         [("s1", "pid=1:platform=desktop", time.time() + 300)])
+        conn.close()
+        self._run(self._event(), self._gateway())
+        state = self._t.state()
+        self.assertNotIn("handoff_tokens", state)   # no Yes/No token
+        self.assertNotIn("handoff_pending", state)  # no parked message
+        self.assertEqual(self._native_calls, [])    # no prompt/keyboard send
+        # nothing consumed the lease either (no cross-device stop)
+        check = sqlite3.connect(str(self._t.home / "state.db"))
+        self.assertIsNotNone(check.execute(
+            "SELECT 1 FROM session_turn_leases WHERE conversation_id='s1'").fetchone())
+        check.close()
+
+    # (c) the message is never lost ---------------------------------------------
+
+    def test_message_text_survives_untouched(self):
+        # the hook must not rewrite or drop the text: the very same string is
+        # what the gateway dispatches after the hook returns None
+        event = self._event(text="важное сообщение, не потерять")
+        before = event.text
+        result = self._run(event, self._gateway())
+        self.assertIsNone(result)
+        self.assertEqual(event.text, before)
+
+    def test_event_object_not_replaced(self):
+        # None (not a new event / not a dict) means the core keeps dispatching
+        # the SAME event object it passed in
+        event = self._event()
+        result = self._run(event, self._gateway())
+        self.assertIsNone(result)
+        self.assertIsNot(result, event)
 
     def test_exceptions_fail_open(self):
         class _Boom:
@@ -401,6 +505,11 @@ class HookFailOpenTests(unittest.TestCase):
                 raise RuntimeError("boom")
         result = asyncio.run(handoff.on_pre_gateway_dispatch(_Boom(), None, None))
         self.assertIsNone(result)
+
+    def test_weird_event_shapes_fail_open(self):
+        for weird in (None, 42, object()):
+            result = asyncio.run(handoff.on_pre_gateway_dispatch(weird, None, None))
+            self.assertIsNone(result)
 
 
 if __name__ == "__main__":
