@@ -20,7 +20,11 @@ inline-кнопками, бесшовный sync Telegram ↔ десктоп, ap
 ## Установка (на машине получателя)
 
 1. Установи Hermes (`hermes-agent`) и запусти gateway.
-2. Скопируй этот каталог в `~/.hermes/plugins/tg-projects/`.
+2. Склонируй плагин в `~/.hermes/plugins/tg-projects/`:
+   ```
+   git clone https://github.com/Dox1k/sd-telegram-hermess-handoff.git ~/.hermes/plugins/tg-projects
+   ```
+   Обновления потом: `git -C ~/.hermes/plugins/tg-projects pull`.
 3. Создай своего бота у @BotFather, токен положи в `~/.hermes/.env`:
    ```
    TELEGRAM_BOT_TOKEN=<токен>
@@ -60,3 +64,5 @@ TGP_PLUGIN_DIR=~/.hermes/plugins/tg-projects python3 -m pytest <repo> -q
 - Команды BotFather пушатся автоматически (chat-scope владелька).
 - История плагина: см. `git log` — модель «handoff Yes/No» удалена,
   seamless sync вместо неё.
+- `state.json` (привязки топиков, локальное состояние) в репозиторий не
+  входит: создаётся при работе, `.gitignore`.
