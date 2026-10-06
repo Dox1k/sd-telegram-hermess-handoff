@@ -769,6 +769,15 @@ async def _pc_reply_mirror_loop(native: Any) -> None:
                 if until is not None:
                     _PC_MIRROR_TG_UNTIL[sid] = until
                 tg_until = _PC_MIRROR_TG_UNTIL.get(sid, 0.0)
+                now = time.time()
+                if now < tg_until:
+                    # This process served a turn for the session recently
+                    # (pre_llm_call mark) or holds its lease — the adapter
+                    # delivered the reply itself. Adopt the rows as seen
+                    # WITHOUT mirroring them (else every TG turn is duplicated).
+                    _PC_MIRROR_SEEN[sid] = max(
+                        _PC_MIRROR_SEEN.get(sid, 0), int(rows[-1]["id"]))
+                    continue
                 chat_id, _, tid = bindings[sid].partition(":")
                 for row in rows:
                     _PC_MIRROR_SEEN[sid] = max(_PC_MIRROR_SEEN.get(sid, 0), int(row["id"]))
@@ -1732,11 +1741,17 @@ def _on_pre_llm_call(**kwargs) -> None:
 
     Idempotent: _apply_session_cwd records the last applied cwd per session id
     and no-ops on repeats, so steady-state turns cost one dict lookup.
+
+    ALSO marks the session as "just served by THIS process": pre_llm_call runs
+    per turn in the TG gateway, so a turn here means the adapter delivers the
+    reply itself — the PC reply mirror must not duplicate it. The desktop
+    process never runs this hook, so desktop replies keep mirroring.
     """
     try:
         session_id = str(kwargs.get("session_id") or kwargs.get("task_id") or "").strip()
         if not session_id:
             return
+        _PC_MIRROR_TG_UNTIL[session_id] = time.time() + _PC_MIRROR_TG_GRACE_S
         cwd, reason = None, ""
 
         binding = _get_topic_binding()
@@ -2135,7 +2150,8 @@ async def _do_resume_by_id(query, session_id: str) -> None:
     state_conn = _sessions_state_conn()
     try:
         row = state_conn.execute(
-            "SELECT id, title, source, cwd, started_at, message_count FROM sessions WHERE id = ?",
+            "SELECT id, title, source, cwd, started_at, message_count, model,"
+            " input_tokens, output_tokens FROM sessions WHERE id = ?",
             (session_id,),
         ).fetchone()
         sessions_tail = _last_user_lines(state_conn, session_id, limit=2)
@@ -2177,8 +2193,12 @@ async def _do_resume_by_id(query, session_id: str) -> None:
                 session_id, cross_origin, admin, cmd)
 
     lines = [
-        f"▶️ Продолжаю сессию {session_id} ({_fmt_ts(row['started_at'])}) — {row['message_count']} msg",
+        f"▶️ Продолжаю сессию {session_id} ({_fmt_ts(row['started_at'])})",
         f"Каталог: {cwd or 'не указан'}",
+        f"💬 {row['message_count']} msg · "
+        f"🔤 {int(row['input_tokens'] or 0) + int(row['output_tokens'] or 0)} токенов "
+        f"(in {int(row['input_tokens'] or 0)} / out {int(row['output_tokens'] or 0)})",
+        f"🤖 {row['model'] or 'модель не указана'}",
     ]
     if _desktop_note(row["source"]):
         lines.append(_desktop_note(row["source"]))

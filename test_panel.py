@@ -190,7 +190,8 @@ class _FakeStateDBSchema:
         self.conn.execute(
             "CREATE TABLE sessions (id TEXT PRIMARY KEY, source TEXT, cwd TEXT,"
             " started_at REAL, message_count INTEGER, title TEXT, chat_id TEXT,"
-            " thread_id TEXT, ended_at REAL)")
+            " thread_id TEXT, ended_at REAL, model TEXT,"
+            " input_tokens INTEGER DEFAULT 0, output_tokens INTEGER DEFAULT 0)")
         self.conn.execute(
             "CREATE TABLE messages (session_id TEXT, role TEXT, content TEXT)")
         self.conn.execute(
