@@ -481,6 +481,23 @@ async def _send_sync_notice(chat_id: str, thread_id: Any, text: str) -> None:
         logger.warning("tg-projects: sync notice send failed", exc_info=True)
 
 
+# Rate-limited like _SYNC_WARNED: the pick notice repeats at most once per
+# _SYNC_WARN_EVERY_S while the chat's binding has no session picked yet.
+_PICK_NOTICED: Dict[str, float] = {}
+
+
+async def _send_pick_notice(chat_id: str, thread_id: Any) -> None:
+    """A binding without a chosen session: nudge to the panel's pick screen."""
+    key = f"{chat_id}:{_norm_thread_id(thread_id)}"
+    now = time.time()
+    if now - _PICK_NOTICED.get(key, 0.0) < _SYNC_WARN_EVERY_S:
+        return
+    _PICK_NOTICED[key] = now
+    await _send_sync_notice(
+        chat_id, thread_id,
+        "Проект выбран, но сессия ещё не выбрана: /menu → [🧵 Сессия] или [➕ Новая].")
+
+
 async def _on_pre_gateway_dispatch_sync(event, gateway, session_store=None, **kwargs):
     """``pre_gateway_dispatch`` — seamless topic sync (fail-open, never blocks).
 
@@ -547,19 +564,23 @@ async def _on_pre_gateway_dispatch_sync(event, gateway, session_store=None, **kw
                     _panel(chat_id, tid)
             return {"action": "skip", "reason": "unbound_topic"}
 
-        # Project bound, session not yet recorded: adopt the project's LATEST
-        # session as the default (the "choose project, just talk" flow), show
-        # the enter-summary once, and steer the lane below. A project with no
-        # sessions lets the first turn create one (on_session_start binds it).
+        # Project bound, session not yet recorded: when the cwd has sessions,
+        # the user must PICK (or explicitly start fresh via _pb_pick_project's
+        # ask-screen — session stays null): silent adoption of the cwd's
+        # LATEST session opened "someone else's history" on shared-root cwds.
+        # A cwd with NO sessions lets the text through — the first turn
+        # creates and binds the session (on_session_start); blocking here
+        # deadlocked the first turn after /new.
         bound_sid = str(binding.get("session_id") or "").strip()
         if not bound_sid:
-            latest_id = _latest_session_id_for_cwd(str(binding.get("cwd") or ""))
-            if latest_id:
-                _update_binding_session_at(chat_id, tid, latest_id)
-                bound_sid = latest_id
-                await _send_session_info(chat_id, tid, latest_id)
-            else:
-                return None
+            if _latest_session_id_for_cwd(str(binding.get("cwd") or "")):
+                _panel = globals().get("_ensure_topic_panel")
+                if callable(_panel):
+                    with _suppress(Exception):
+                        _panel(chat_id, tid)
+                await _send_pick_notice(chat_id, tid)
+                return {"action": "skip", "reason": "awaiting_session_pick"}
+            return None
 
         # Bound topic: steer the lane onto binding.session_id when drifted.
         store = session_store if session_store is not None else getattr(
@@ -2649,6 +2670,7 @@ _PB_CB_PREFIX = "tgp:pb:"
 _PB_SESSIONS_LIMIT = 20
 _PB_CB_PROJ_RE = re.compile(r"^tgp:pb:projp:(\d+)$")
 _PB_CB_SESS_RE = re.compile(r"^tgp:pb:sesss:([A-Za-z0-9_\-]{8,46})$")
+_PB_CB_PICK_RE = re.compile(r"^tgp:pb:pick:([A-Za-z0-9_\-]{8,46})$")
 _PB_CB_MORE_RE = re.compile(r"^tgp:pb:more:cmd:(status|diff|agents|help)$")
 
 
@@ -2999,14 +3021,48 @@ async def _pb_pick_project(query, chat_id: str, thread_id: Optional[int],
         return
     _pb_write_binding(chat_id, thread_id, getattr(project, "id", None),
                       getattr(project, "name", None), cwd, None)
-    # Default pick: the project's LATEST session becomes the chat's active
-    # session immediately (the "choose project, just talk" flow), with the
-    # enter-summary (the chat's reusable info message).
+    # The project has prior sessions: ASK — continue the latest or start a
+    # fresh chat. Auto-adopting the latest confused users ("my new project
+    # opened with someone else's history") when the cwd was a shared root
+    # (e.g. /mnt/mydisk itself). No sessions → the first turn creates one.
     latest_id = _latest_session_id_for_cwd(cwd)
     if latest_id:
-        _pb_write_binding_session(chat_id, thread_id, latest_id)
-        await _send_session_info(chat_id, thread_id, latest_id)
+        state_conn = _sessions_state_conn()
+        try:
+            sessions = _sessions_for_cwd(state_conn, cwd, limit=_PB_SESSIONS_LIMIT)
+        finally:
+            with _suppress(Exception):
+                state_conn.close()
+        _pb_write_binding_session(chat_id, thread_id, None)  # unbound until picked
+        await _pb_pick_ask(query, project, latest_id, sessions)
+        return
     await _pb_render(query, chat_id, thread_id)
+
+
+async def _pb_pick_ask(query, project, latest_id: str, sessions: list) -> None:
+    """'New project selected' screen: [▶️ Продолжить последнюю] / [➕ Новая].
+
+    Continue → _pb_pick_session (resume + bind); New → _pb_new_session (/new
+    in the cwd, bound by on_session_start). Editing the PANEL message keeps
+    the pick screens on the pinned panel, back via [⬅️ Назад].
+    """
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+    latest = next((s for s in sessions if str(s.get("id")) == str(latest_id)), None)
+    label = _pb_session_label(latest) if latest else _pb_short_session_id(latest_id)
+    status = (latest or {}).get("status") or "idle"
+    rows = [
+        [InlineKeyboardButton(f"▶️ Продолжить: {label} · {status}",
+                              callback_data=f"{_PB_CB_PREFIX}pick:{latest_id}")],
+        [InlineKeyboardButton("➕ Новая сессия (пустой чат)",
+                              callback_data=f"{_PB_CB_PREFIX}new")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data=f"{_PB_CB_PREFIX}back")],
+    ]
+    with _suppress(Exception):
+        await query.edit_message_text(
+            f"📁 Проект «{getattr(project, 'name', '?')}» выбран.\n\n"
+            f"В этом каталоге есть сессии ({len(sessions)}). Продолжить последнюю "
+            "или начать новый чат?",
+            reply_markup=InlineKeyboardMarkup(rows))
 
 
 def _latest_session_id_for_cwd(cwd: str) -> str:
@@ -3279,13 +3335,17 @@ async def _handle_panel_callback(query, data: str) -> None:
             if m is not None:
                 await _pb_pick_project(query, chat_id, thread_id, m.group(1))
             else:
-                m = _PB_CB_SESS_RE.match(data)
+                m = _PB_CB_PICK_RE.match(data)
                 if m is not None:
                     await _pb_pick_session(query, chat_id, thread_id, m.group(1))
                 else:
-                    m = _PB_CB_MORE_RE.match(data)
+                    m = _PB_CB_SESS_RE.match(data)
                     if m is not None:
-                        await _pb_run_command(query, m.group(1))
+                        await _pb_pick_session(query, chat_id, thread_id, m.group(1))
+                    else:
+                        m = _PB_CB_MORE_RE.match(data)
+                        if m is not None:
+                            await _pb_run_command(query, m.group(1))
         with _suppress(Exception):
             await query.answer()
     except Exception as exc:
@@ -3858,20 +3918,27 @@ def _wizard_validate_name(name: str) -> Optional[str]:
     return None
 
 
-def _wizard_path_error(name: str, path: str) -> Optional[str]:
+def _wizard_path_error(name: str, path: str, create_dir: bool = False) -> Optional[str]:
     """Error text for a bad path (shape, existence, duplicates), or None.
 
     Both duplicate kinds are checked against projects.db up front: the slug
     the wizard would generate and the primary_path itself (the same check
     create_project applies via find_by_primary_path — checked first here so
     the user gets a readable message instead of a raised ValueError).
+    ``create_dir=True`` (the wizard's default answer to a missing directory)
+    turns the "does not exist" error into a plain note — _wizard_create
+    makes the directory; a path occupied by a FILE still fails.
     """
     path = str(path or "").strip()
     if not path.startswith("/"):
         return f"❌ Путь «{path}» не абсолютный — нужен путь от корня, например /mnt/mydisk/sd2."
     if not os.path.isdir(path):
-        return (f"❌ Каталог {path} не существует. Мастер не создаёт каталоги — "
-                "укажите существующий абсолютный путь.")
+        if not create_dir:
+            return (f"❌ Каталог {path} не существует. Мастер создаёт каталоги — "
+                    "проверьте путь (нажмите «❌ Отмена», если ошиблись).")
+        if os.path.exists(path):
+            return (f"❌ По пути {path} уже есть файл, не каталог — "
+                    "укажите другой путь.")
     slug = _wizard_slug(name)
     try:
         projects_db = _import_hermes_module("hermes_cli.projects_db")
@@ -3890,10 +3957,17 @@ def _wizard_path_error(name: str, path: str) -> Optional[str]:
     return None
 
 
-def _wizard_create(name: str, path: str) -> tuple:
-    """``(project_id, slug, error_text)`` — success or failure, never raises."""
+def _wizard_create(name: str, path: str, create_dir: bool = False) -> tuple:
+    """``(project_id, slug, error_text)`` — success or failure, never raises.
+
+    ``create_dir=True`` makes missing parent directories (os.makedirs):
+    the wizard's default — a fresh project usually starts from a fresh
+    folder. Existing dirs are reused; a FILE occupying the path fails.
+    """
     slug = _wizard_slug(name)
     try:
+        if create_dir and not os.path.isdir(path):
+            os.makedirs(path, exist_ok=True)
         projects_db = _import_hermes_module("hermes_cli.projects_db")
         with projects_db.connect_closing() as conn:
             pid = projects_db.create_project(conn, name=name, slug=slug, primary_path=path)
@@ -4026,9 +4100,9 @@ async def _wizard_hook_impl(event: Any) -> Optional[Dict[str, Any]]:
         path = text.strip().strip('"')
         err = _wizard_validate_name(name)
         if err is None:
-            err = _wizard_path_error(name, path)
+            err = _wizard_path_error(name, path, create_dir=True)
         if err is None:
-            pid, slug, err = _wizard_create(name, path)
+            pid, slug, err = _wizard_create(name, path, create_dir=True)
         if err is not None:
             entry["updated_at"] = int(time.time())
             _wizard_put(key, entry)

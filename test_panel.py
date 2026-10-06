@@ -604,15 +604,30 @@ class PanelCallbackTests(_StubbedTestCase):
         self.assertIsNone(entry["session_id"])  # no seeded sessions: nothing to adopt
         self.assertEqual(query.edits[-1][0], f"📁  NeiroSlop\n🧵  —\n📂  {CWD}")
 
-    def test_projp_pick_adopts_latest_session(self):
-        # "Выбери проект и просто пиши": the project's LATEST session becomes
-        # the active one right away, with the enter-summary message.
+    def test_projp_pick_asks_when_sessions_exist(self):
+        # Sessions exist in the project cwd: ASK first (continue latest /
+        # fresh chat) instead of silently adopting the latest — auto-adoption
+        # opened "someone else's history" on shared-root cwds.
         _seed_session(SID, count=7)
         query = self._tap("tgp:pb:projp:1")
         entry = _STATE_DATA["topic_bindings"][KEY]
+        self.assertIsNone(entry["session_id"])  # not auto-bound
+        rows = query.edits[0][1].rows
+        self.assertEqual(rows[0][0].callback_data, f"tgp:pb:pick:{SID}")
+        self.assertEqual(rows[1][0].callback_data, "tgp:pb:new")
+        self.assertIn("Продолжить последнюю", query.edits[0][0])
+
+    def test_projp_pick_then_continue_resumes_latest(self):
+        # The [▶️ Продолжить] answer on the ask-screen behaves like a session
+        # pick: binds the session and sends the resume.
+        _STATE_DATA["topic_bindings"] = {KEY: _binding_entry(None)}
+        _seed_session(SID, count=7)
+        with _with_env(HERMES_HOME="/nonexistent-panel-tmp"):
+            query = self._tap(f"tgp:pb:pick:{SID}")
+        entry = _STATE_DATA["topic_bindings"][KEY]
         self.assertEqual(entry["session_id"], SID)
-        self.assertIn("🧵 Сессия:", self.bot.sent[0]["text"])
-        self.assertIn(SID, self.bot.sent[0]["text"])
+        self.assertTrue(any(getattr(e, "text", "") == f"/resume {SID}"
+                            for e in self.adapter.events))
 
     def test_projp_stale_index_shows_error(self):
         query = self._tap("tgp:pb:projp:9")

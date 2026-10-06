@@ -404,17 +404,18 @@ class ErrorRetryTests(_WizardTest):
         _dispatch("SD2")
         self.assertEqual(mod._wizard_get(KEY)["step"], "path")
 
-    def test_missing_path_repeats_question(self):
+    def test_missing_path_is_created_then_success(self):
+        # The wizard CREATES missing directories now (a fresh project starts
+        # from a fresh folder): a nonexistent path under a writable root
+        # succeeds and create_project sees the made path.
         self._to_path_step("SD2")
-        result = _dispatch("/nonexistent/wiz/xyz")
+        target = os.path.join(self.tmp.name, "brand", "new")
+        result = _dispatch(target)
         self.assertEqual(result, {"action": "skip", "reason": "project_wizard"})
-        self.assertIn("не существует", _sent()["text"])
-        self.assertIn("Путь к каталогу", _sent()["text"])
-        self.assertEqual(mod._wizard_get(KEY)["step"], "path")
-        self.assertEqual(CREATE_CALLS, [])
-        # retry with a real path succeeds
-        _dispatch(self.tmp.name)
-        self.assertEqual(len(CREATE_CALLS), 1)
+        self.assertIn("Проект создан", _sent()["text"])
+        self.assertEqual(CREATE_CALLS, [{"name": "SD2", "slug": "sd2",
+                                         "primary_path": target}])
+        self.assertTrue(os.path.isdir(target))
 
     def test_duplicate_path_blocks_creation(self):
         PROJECTS.append(_FakeProject("p1", "SD1", "sd1", self.tmp.name))

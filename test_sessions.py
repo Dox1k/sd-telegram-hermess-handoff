@@ -774,10 +774,39 @@ class SyncHookFlatTests(unittest.TestCase):
     def test_project_without_session_lets_text_through(self):
         # Regression: binding has the project but session_id is still empty
         # (right after /new, before the first turn) — blocking here returned
-        # "выбери проект" and deadlocked the first turn.
+        # "выбери проект" and deadlocked the first turn. The cwd has NO
+        # sessions yet in this scenario: the text must flow (first turn
+        # creates and binds the session via on_session_start).
         self._bind_flat()
         result = asyncio_run(mod._on_pre_gateway_dispatch_sync(self._event("привет"), None))
         self.assertIsNone(result)
+
+    def test_project_with_sessions_but_none_picked_asks(self):
+        # A cwd WITH sessions and nothing picked: the user is sent to the
+        # pick screen instead of silently adopting the cwd's latest session
+        # (which may be an unrelated chat that merely shares the directory).
+        self._bind_flat()
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        conn.execute("CREATE TABLE sessions (id TEXT PRIMARY KEY, source TEXT,"
+                     " cwd TEXT, started_at REAL, ended_at REAL, title TEXT,"
+                     " chat_id TEXT, thread_id TEXT, message_count INTEGER,"
+                     " last_activity_at REAL)")
+        conn.execute("INSERT INTO sessions VALUES ('s_old', 'telegram',"
+                     " '/mnt/mydisk/sd1', 1791310000.0, NULL, 'Старая',"
+                     " '7559860199', NULL, 3, 1791310000.0)")
+        conn.execute("CREATE TABLE messages (session_id TEXT, role TEXT,"
+                     " content TEXT)")
+        orig = mod._open_state_db
+        mod._open_state_db = lambda: conn
+        try:
+            with _with_env(HERMES_HOME="/nonexistent-sync-tmp"):
+                result = asyncio_run(
+                    mod._on_pre_gateway_dispatch_sync(self._event("привет"), None))
+        finally:
+            mod._open_state_db = orig
+            conn.close()
+        self.assertEqual(result, {"action": "skip", "reason": "awaiting_session_pick"})
 
     def test_no_binding_at_all_still_redirects_to_menu(self):
         result = asyncio_run(mod._on_pre_gateway_dispatch_sync(self._event("привет"), None))
