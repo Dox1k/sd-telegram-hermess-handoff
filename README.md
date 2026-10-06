@@ -1,4 +1,4 @@
-# tg-projects — Telegram-интерфейс для Hermes
+# TelegramHermessHandoff — Telegram-интерфейс для Hermes
 
 Один чат (или форум-топик) = один проект + одна активная сессия. Панель с
 inline-кнопками, бесшовный sync Telegram ↔ десктоп, approve/deny опасных
