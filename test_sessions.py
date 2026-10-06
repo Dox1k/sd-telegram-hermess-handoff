@@ -511,11 +511,11 @@ class SessionQueryTests(unittest.TestCase):
     def test_listing_is_cross_origin(self):
         conn = _FAKE_STATE.conn
         conn.execute("INSERT INTO sessions (id, source, cwd, started_at,"
-                     " message_count) VALUES (?,  ?, ?, ?, ?)",
-                     ("s-desktop", "desktop", "/p", 100.0, 5))
+                     " message_count, last_activity_at) VALUES (?, ?, ?, ?, ?, ?)",
+                     ("s-desktop", "desktop", "/p", 100.0, 5, time.time()))
         conn.execute("INSERT INTO sessions (id, source, cwd, started_at,"
-                     " message_count) VALUES (?,  ?, ?, ?, ?)",
-                     ("s-tg", "telegram", "/p", 200.0, 3))
+                     " message_count, last_activity_at) VALUES (?, ?, ?, ?, ?, ?)",
+                     ("s-tg", "telegram", "/p", 200.0, 3, time.time()))
         conn.commit()
         rows = mod._sessions_for_cwd(conn, "/p", limit=2)
         self.assertEqual([r["id"] for r in rows], ["s-tg", "s-desktop"])
@@ -524,11 +524,11 @@ class SessionQueryTests(unittest.TestCase):
     def test_session_live_status_uses_turn_lease(self):
         conn = _FAKE_STATE.conn
         conn.execute("INSERT INTO sessions (id, source, cwd, started_at,"
-                     " message_count) VALUES (?,  ?, ?, ?, ?)",
-                     ("s-running", "desktop", "/p", 100.0, 5))
+                     " message_count, last_activity_at) VALUES (?, ?, ?, ?, ?, ?)",
+                     ("s-running", "desktop", "/p", 100.0, 5, time.time()))
         conn.execute("INSERT INTO sessions (id, source, cwd, started_at,"
-                     " message_count) VALUES (?,  ?, ?, ?, ?)",
-                     ("s-idle", "telegram", "/p", 200.0, 3))
+                     " message_count, last_activity_at) VALUES (?, ?, ?, ?, ?, ?)",
+                     ("s-idle", "telegram", "/p", 200.0, 3, time.time()))
         conn.execute(
             "INSERT INTO session_turn_leases (conversation_id, holder,"
             " acquired_at, expires_at) VALUES (?, ?, ?, ?)",
@@ -545,8 +545,8 @@ class SessionQueryTests(unittest.TestCase):
     def test_session_live_status_handles_expired_lease_and_missing_table(self):
         conn = _FAKE_STATE.conn
         conn.execute("INSERT INTO sessions (id, source, cwd, started_at,"
-                     " message_count) VALUES (?,  ?, ?, ?, ?)",
-                     ("s-expired", "desktop", "/p", 100.0, 5))
+                     " message_count, last_activity_at) VALUES (?, ?, ?, ?, ?, ?)",
+                     ("s-expired", "desktop", "/p", 100.0, 5, time.time()))
         conn.execute(
             "INSERT INTO session_turn_leases (conversation_id, holder,"
             " acquired_at, expires_at) VALUES (?, ?, ?, ?)",
@@ -569,8 +569,8 @@ class SessionQueryTests(unittest.TestCase):
     def test_sessions_lines_show_status_and_device(self):
         conn = _FAKE_STATE.conn
         conn.execute("INSERT INTO sessions (id, source, cwd, started_at,"
-                     " message_count) VALUES (?,  ?, ?, ?, ?)",
-                     ("s-running", "desktop", "/p", 100.0, 5))
+                     " message_count, last_activity_at) VALUES (?, ?, ?, ?, ?, ?)",
+                     ("s-running", "desktop", "/p", 100.0, 5, time.time()))
         conn.execute(
             "INSERT INTO session_turn_leases (conversation_id, holder,"
             " acquired_at, expires_at) VALUES (?, ?, ?, ?)",
@@ -585,11 +585,11 @@ class SessionQueryTests(unittest.TestCase):
     def test_source_filter(self):
         conn = _FAKE_STATE.conn
         conn.execute("INSERT INTO sessions (id, source, cwd, started_at,"
-                     " message_count) VALUES (?,  ?, ?, ?, ?)",
-                     ("s-d", "desktop", "/p", 1.0, 1))
+                     " message_count, last_activity_at) VALUES (?, ?, ?, ?, ?, ?)",
+                     ("s-d", "desktop", "/p", 1.0, 1, time.time()))
         conn.execute("INSERT INTO sessions (id, source, cwd, started_at,"
-                     " message_count) VALUES (?,  ?, ?, ?, ?)",
-                     ("s-t", "telegram", "/p", 2.0, 1))
+                     " message_count, last_activity_at) VALUES (?, ?, ?, ?, ?, ?)",
+                     ("s-t", "telegram", "/p", 2.0, 1, time.time()))
         conn.commit()
         self.assertEqual([r["id"] for r in
                            mod._sessions_for_cwd(conn, "/p", source="desktop")],
@@ -598,8 +598,8 @@ class SessionQueryTests(unittest.TestCase):
     def test_empty_message_count_excluded(self):
         conn = _FAKE_STATE.conn
         conn.execute("INSERT INTO sessions (id, source, cwd, started_at,"
-                     " message_count) VALUES (?,  ?, ?, ?, ?)",
-                     ("s-empty", "telegram", "/p", 1.0, 0))
+                     " message_count, last_activity_at) VALUES (?, ?, ?, ?, ?, ?)",
+                     ("s-empty", "telegram", "/p", 1.0, 0, time.time()))
         conn.commit()
         self.assertEqual(mod._sessions_for_cwd(conn, "/p"), [])
 
@@ -783,10 +783,17 @@ class SyncHookFlatTests(unittest.TestCase):
         result = asyncio_run(mod._on_pre_gateway_dispatch_sync(self._event("привет"), None))
         self.assertEqual(result, {"action": "skip", "reason": "unbound_topic"})
 
-    def test_command_and_non_dm_flow_untouched(self):
+    def test_menu_command_is_consumed_before_dispatch(self):
+        # /menu is an interface command: the hook consumes it (panel refresh)
+        # so a busy turn is never interrupted and the agent never sees the text.
+        self._bind_flat()
+        result = asyncio_run(mod._on_pre_gateway_dispatch_sync(self._event("/menu"), None))
+        self.assertEqual(result, {"action": "skip", "reason": "tg_menu"})
+
+    def test_other_commands_flow_untouched(self):
         self._bind_flat()
         self.assertIsNone(
-            asyncio_run(mod._on_pre_gateway_dispatch_sync(self._event("/menu"), None)))
+            asyncio_run(mod._on_pre_gateway_dispatch_sync(self._event("/model"), None)))
 
 
 class SessionsKeyboardTests(unittest.TestCase):

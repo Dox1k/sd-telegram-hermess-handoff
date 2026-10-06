@@ -481,7 +481,7 @@ class PanelTextTests(_StubbedTestCase):
         status = mod._pb_session_status(_FAKE_STATE.conn, SID)
         self.assertEqual(status, "online")
         text = mod._pb_panel_text(_binding_entry(SID), status)
-        self.assertEqual(text, f"📁  NeiroSlop\n🧵  20261003_062… · online\n📂  {CWD}")
+        self.assertEqual(text, f"📁  NeiroSlop\n🧵  20261003_062… · 12 msg · online\n📂  {CWD}")
 
     def test_render_binding_with_session_idle(self):
         _seed_session(SID)  # no lease -> idle
@@ -654,7 +654,7 @@ class PanelCallbackTests(_StubbedTestCase):
                             for e in self.adapter.events))
         # the panel re-renders after the resume
         self.assertEqual(query.edits[-1][0],
-                         f"📁  NeiroSlop\n🧵  20261003_062… · idle\n📂  {CWD}")
+                         f"📁  NeiroSlop\n🧵  20261003_062… · 12 msg · idle\n📂  {CWD}")
 
     def test_sesss_pick_unknown_session(self):
         _STATE_DATA["topic_bindings"] = {KEY: _binding_entry(None)}
@@ -775,7 +775,7 @@ class PanelCreateTests(_StubbedTestCase):
         self.assertEqual(self.bot.deleted, [{"chat_id": int(CHAT), "message_id": 123}])
         self.assertEqual(len(self.bot.sent), 1)
         self.assertEqual(self.bot.sent[0]["text"],
-                         f"📁  NeiroSlop\n🧵  20261003_062… · online\n📂  {CWD}")
+                         f"📁  NeiroSlop\n🧵  20261003_062… · 12 msg · online\n📂  {CWD}")
         self.assertNotEqual(mod._pb_get_panel_message_id(CHAT, THREAD), 123)
         self.assertEqual(self.bot.pinned[0]["message_id"],
                          mod._pb_get_panel_message_id(CHAT, THREAD))

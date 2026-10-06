@@ -508,7 +508,8 @@ async def _on_pre_gateway_dispatch_sync(event, gateway, session_store=None, **kw
             return None
         text = str(getattr(event, "text", "") or "").strip()
         if not text or text.startswith("/"):
-            return None  # commands keep the normal (interrupt-capable) path
+            if text.split(" ", 1)[0] != "/menu":
+                return None  # commands keep the normal (interrupt-capable) path
         if str(getattr(source, "chat_type", "") or "") != "dm":
             return None  # bindings are DM-topic keyed
         chat_id = str(getattr(source, "chat_id", "") or "").strip()
@@ -517,6 +518,18 @@ async def _on_pre_gateway_dispatch_sync(event, gateway, session_store=None, **kw
             return None
         if tid is None:
             tid = 0  # topic-less DM (topics off): the chat's single flat lane
+
+        # /menu is an INTERFACE command: it must never interrupt a running
+        # turn nor leak into the agent's chat (a busy-turn dispatch turned
+        # "/menu" into an LLM prompt mid-task once — fixed here by consuming
+        # the event before the command layer sees it).
+        head = text.split(" ", 1)[0]
+        if head == "/menu":
+            _prune_stale_state()
+            _migrate_flat_bindings()
+            _wizard_reset_chat(chat_id)
+            await _pb_create(chat_id, tid)
+            return {"action": "skip", "reason": "tg_menu"}
 
         binding = _binding_at(chat_id, tid)
         if not binding or not str(binding.get("cwd") or "").strip():
@@ -1245,13 +1258,16 @@ def _sessions_for_cwd(state_conn, cwd: str, limit: int = 2, source: Optional[str
     """
     rows = []
     try:
-        # Live sessions, plus recently-active ended ones (a /new reset ends the
-        # lane session but it stays open as a desktop tab and pickable for ~a
-        # day); anything older than that is history the user does not want.
+        # Sessions ACTIVE within the last day, regardless of the ended flag:
+        # a /new reset ends the lane session but it stays a pickable desktop
+        # tab, while a never-ended desktop session idle for days (the "ghost"
+        # row) must not resurface in every project pick. Unknown-activity rows
+        # (no last_activity/started stamps) are kept — never guess.
         cutoff = time.time() - 86400.0
         sql = ("SELECT id, title, source, started_at, message_count FROM sessions "
                "WHERE cwd = ? AND message_count > 0"
-               " AND (ended_at IS NULL OR COALESCE(last_activity_at, started_at) > ?)")
+               " AND (COALESCE(last_activity_at, started_at) IS NULL"
+               "      OR COALESCE(last_activity_at, started_at) > ?)")
         args: list = [cwd, cutoff]
         if source:
             sql += " AND source = ?"
@@ -2716,28 +2732,52 @@ def _pb_session_label(s: Dict[str, Any]) -> str:
     return (_pb_short_session_id(sid) if sid else "—")
 
 
+def _pb_compact_tokens(in_tok: int, out_tok: int) -> str:
+    """Compact token count: '118K' / '3.4K' / '840'."""
+    total = max(0, int(in_tok)) + max(0, int(out_tok))
+    if total >= 100000:
+        return f"{round(total / 1000)}K"
+    if total >= 1000:
+        return f"{total / 1000:.1f}K"
+    return str(total)
+
+
+def _pb_panel_session_line(session_id: str, status: str) -> str:
+    """The panel's 🧵 line: the live session digest — title, volume, model."""
+    try:
+        state_conn = _sessions_state_conn()
+        try:
+            row = state_conn.execute(
+                "SELECT title, model, message_count, input_tokens, output_tokens"
+                " FROM sessions WHERE id = ?", (session_id,)
+            ).fetchone()
+        finally:
+            with _suppress(Exception):
+                state_conn.close()
+        if row is None:
+            return f"{_pb_short_session_id(session_id)} · {status or 'idle'}"
+        title = str(row["title"] or "").strip()
+        label = _trim(title, 24) if title and title != "(без названия)" \
+            else _pb_short_session_id(session_id)
+        parts = [label, f"{int(row['message_count'] or 0)} msg"]
+        tokens = _pb_compact_tokens(row["input_tokens"], row["output_tokens"])
+        if tokens != "0":
+            parts.append(tokens)
+        model = _trim(str(row["model"] or "").strip(), 18)
+        if model:
+            parts.append(model)
+        parts.append(status or "idle")
+        return " · ".join(parts)
+    except Exception:
+        return f"{_pb_short_session_id(session_id)} · {status or 'idle'}"
+
+
 def _pb_panel_text(binding: Optional[Dict[str, Any]], status: str = "") -> str:
-    """The pinned panel body: project / session / cwd."""
+    """The pinned panel body: project / live session digest / cwd."""
     if not binding:
         return "📁  —\n🧵  —\n📂  —\n\nСначала выбери проект: [📁 Проект]"
     session_id = str(binding.get("session_id") or "").strip()
-    session_line = f"{_pb_short_session_id(session_id)} · {status or 'idle'}" if session_id else "—"
-    if session_id:
-        # Prefer the session's Hermes title (state.db sessions.title) over the raw id.
-        try:
-            state_conn = _sessions_state_conn()
-            try:
-                row = state_conn.execute(
-                    "SELECT title FROM sessions WHERE id = ?", (session_id,)
-                ).fetchone()
-                title = str((row["title"] if row is not None else "") or "").strip()
-            finally:
-                with _suppress(Exception):
-                    state_conn.close()
-            if title and title != "(без названия)":
-                session_line = f"{_trim(title, 28)} · {status or 'idle'}"
-        except Exception:
-            pass
+    session_line = _pb_panel_session_line(session_id, status) if session_id else "—"
     return (
         f"📁  {binding.get('project_name') or '—'}\n"
         f"🧵  {session_line}\n"
