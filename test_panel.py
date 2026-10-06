@@ -562,6 +562,8 @@ class PanelCallbackTests(_StubbedTestCase):
         _reset_fake_db()
         self.adapter = FakeAdapter()
         mod._ADAPTER = self.adapter
+        self.bot = FakeBot()
+        mod._NATIVE = types.SimpleNamespace(bot=self.bot)
         self.addCleanup(self._restore)
 
     def _restore(self):
@@ -599,8 +601,18 @@ class PanelCallbackTests(_StubbedTestCase):
         self.assertEqual(entry["project_id"], "p1")
         self.assertEqual(entry["project_name"], "NeiroSlop")
         self.assertEqual(entry["cwd"], CWD)
-        self.assertIsNone(entry["session_id"])
+        self.assertIsNone(entry["session_id"])  # no seeded sessions: nothing to adopt
         self.assertEqual(query.edits[-1][0], f"📁  NeiroSlop\n🧵  —\n📂  {CWD}")
+
+    def test_projp_pick_adopts_latest_session(self):
+        # "Выбери проект и просто пиши": the project's LATEST session becomes
+        # the active one right away, with the enter-summary message.
+        _seed_session(SID, count=7)
+        query = self._tap("tgp:pb:projp:1")
+        entry = _STATE_DATA["topic_bindings"][KEY]
+        self.assertEqual(entry["session_id"], SID)
+        self.assertIn("🧵 Сессия:", self.bot.sent[0]["text"])
+        self.assertIn(SID, self.bot.sent[0]["text"])
 
     def test_projp_stale_index_shows_error(self):
         query = self._tap("tgp:pb:projp:9")

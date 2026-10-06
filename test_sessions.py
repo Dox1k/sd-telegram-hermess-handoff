@@ -200,9 +200,22 @@ _FAKE_STATE = _FakeStateDB()
 
 
 def _open_state_db_stub():
-    conn = _FAKE_STATE.conn
-    conn.row_factory = sqlite3.Row
-    return conn
+    # A close-immune proxy over the shared in-memory db: plugin flows close
+    # their state connections in finally blocks, and a raw sqlite3 conn would
+    # die for every later test.
+    return _FakeConnProxy(_FAKE_STATE.conn)
+
+
+class _FakeConnProxy:
+    def __init__(self, conn):
+        self._conn = conn
+        self.row_factory = sqlite3.Row
+
+    def execute(self, sql, params=()):
+        return self._conn.execute(sql, params)
+
+    def close(self):
+        pass
 
 
 # ---------------------------------------------------------------- hermes_state stub

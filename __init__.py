@@ -532,13 +532,21 @@ async def _on_pre_gateway_dispatch_sync(event, gateway, session_store=None, **kw
                     _panel(chat_id, tid)
             return {"action": "skip", "reason": "unbound_topic"}
 
-        # Project bound, session not yet recorded: let the text through —
-        # the first turn creates/starts the lane session and on_session_start
-        # records its id in the binding. Blocking here deadlocked the flow
-        # ("выбери проект" right after /new).
+        # Project bound, session not yet recorded: adopt the project's LATEST
+        # session as the default (the "choose project, just talk" flow), show
+        # the enter-summary once, and steer the lane below. A project with no
+        # sessions lets the first turn create one (on_session_start binds it).
         bound_sid = str(binding.get("session_id") or "").strip()
         if not bound_sid:
-            return None
+            latest_id = _latest_session_id_for_cwd(str(binding.get("cwd") or ""))
+            if latest_id:
+                _update_binding_session_at(chat_id, tid, latest_id)
+                bound_sid = latest_id
+                info = _session_info_text(latest_id)
+                if info:
+                    await _send_sync_notice(chat_id, tid, info)
+            else:
+                return None
 
         # Bound topic: steer the lane onto binding.session_id when drifted.
         store = session_store if session_store is not None else getattr(
@@ -2910,7 +2918,36 @@ async def _pb_pick_project(query, chat_id: str, thread_id: Optional[int],
         return
     _pb_write_binding(chat_id, thread_id, getattr(project, "id", None),
                       getattr(project, "name", None), cwd, None)
+    # Default pick: the project's LATEST session becomes the chat's active
+    # session immediately (the "choose project, just talk" flow), with the
+    # enter-summary so the user always knows WHERE the text lands.
+    latest_id = _latest_session_id_for_cwd(cwd)
+    if latest_id:
+        _pb_write_binding_session(chat_id, thread_id, latest_id)
+        info = _session_info_text(latest_id)
+        bot = getattr(_NATIVE, "bot", None) if _NATIVE is not None else None
+        if info and bot is not None:
+            kwargs: Dict[str, Any] = {"chat_id": chat_id, "text": info}
+            tid = _norm_thread_id(thread_id)
+            if tid:
+                kwargs["message_thread_id"] = tid
+            with _suppress(Exception):
+                await bot.send_message(**kwargs)
     await _pb_render(query, chat_id, thread_id)
+
+
+def _latest_session_id_for_cwd(cwd: str) -> str:
+    """The newest live/recent session id for *cwd*, or '' when there is none."""
+    try:
+        state_conn = _sessions_state_conn()
+        try:
+            rows = _sessions_for_cwd(state_conn, str(cwd or ""), limit=1)
+        finally:
+            with _suppress(Exception):
+                state_conn.close()
+        return str(rows[0]["id"]) if rows else ""
+    except Exception:
+        return ""
 
 
 def _pb_sessions_text(binding: Optional[Dict[str, Any]], sessions: list) -> str:
