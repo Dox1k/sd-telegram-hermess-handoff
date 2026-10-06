@@ -686,9 +686,10 @@ class PanelCallbackTests(_StubbedTestCase):
         self.assertEqual(query.answers[-1], None)  # answered, nothing done
 
     def test_panel_prefix_does_not_hijack_old_callbacks(self):
-        # old flows untouched: tgp:b falls through the panel routing
+        # old flows untouched: tgp:b re-renders the PROJECT LIST (not the panel)
         query = self._tap("tgp:b")
-        self.assertEqual(query.edits, [])
+        self.assertEqual(len(query.edits), 1)
+        self.assertIn("Проекты", query.edits[0][0])
         self.assertEqual(query.answers, [None])
         # and the panel prefix itself is answered without edits when unknown
         query = self._tap("tgp:pb:zzz")

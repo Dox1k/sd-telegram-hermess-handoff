@@ -1350,16 +1350,8 @@ async def _projects_handler(raw_args: str) -> str | None:
             chat_id = _session_env("HERMES_SESSION_CHAT_ID", "")
             thread_id = _session_env("HERMES_SESSION_THREAD_ID", "")
             if chat_id:
-                from telegram import InlineKeyboardButton, InlineKeyboardMarkup
-
-                keyboard = [
-                    [InlineKeyboardButton(f"📁 {p.name} [{p.slug}]",
-                                          callback_data=f"{CB_PREFIX}p:{i}")]
-                    for i, p in enumerate(projects, 1)
-                ]
-                keyboard.append([InlineKeyboardButton("🆕 Новый проект", callback_data="tgp:np")])
                 kwargs = {"chat_id": chat_id, "text": "Проекты — выберите каталог:",
-                          "reply_markup": InlineKeyboardMarkup(keyboard)}
+                          "reply_markup": _project_list_keyboard(projects)}
                 if thread_id:
                     kwargs["message_thread_id"] = int(thread_id) if thread_id.isdigit() else thread_id
                 await bot.send_message(**kwargs)
@@ -1665,13 +1657,35 @@ def _on_pre_llm_call(**kwargs) -> None:
 
 
 # ----------------------------------------------------------------- keyboard builders
-def _project_list_keyboard(projects: list):
+# One project-list page: with 5+ projects the list paginates (tgp:pl:<offset>).
+_PROJECTS_PER_PAGE = 5
+_CB_PL_RE = re.compile(r"^tgp:pl:(\d+)$")
+
+
+def _project_list_keyboard(projects: list, offset: int = 0):
+    """The project picker: one tgp:p:<i> button per project on the current page.
+
+    ``tgp:p:<i>`` carries the GLOBAL 1-based index (project_at resolves it
+    against the full list), so paging never shifts what a button means.
+    More pages than one → an [Ещё] row; page 2+ → a back-to-start row.
+    """
     from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+    offset = max(0, int(offset or 0))
+    page = projects[offset:offset + _PROJECTS_PER_PAGE]
     keyboard = [
         [InlineKeyboardButton(f"📁 {p.name} [{p.slug}]",
-                              callback_data=f"{CB_PREFIX}p:{i}")]
-        for i, p in enumerate(projects, 1)
+                              callback_data=f"{CB_PREFIX}p:{offset + i}")]
+        for i, p in enumerate(page, 1)
     ]
+    if not keyboard:
+        keyboard = [[InlineKeyboardButton("📭 Проектов нет", callback_data=_BACK_CB)]]
+    rest = len(projects) - (offset + _PROJECTS_PER_PAGE)
+    if rest > 0:
+        keyboard.append([InlineKeyboardButton(
+            f"Ещё → (осталось {rest})", callback_data=f"{CB_PREFIX}pl:{offset + _PROJECTS_PER_PAGE}")])
+    if offset > 0:
+        keyboard.append([InlineKeyboardButton(
+            "⬅️ В начало списка", callback_data=f"{CB_PREFIX}pl:0")])
     keyboard.append([InlineKeyboardButton("🆕 Новый проект", callback_data="tgp:np")])
     return InlineKeyboardMarkup(keyboard)
 
@@ -1694,12 +1708,22 @@ def _project_menu_keyboard(index: int, has_sessions: bool, has_cwd: bool):
     return InlineKeyboardMarkup([row1, row2, row3])
 
 
-def _sessions_keyboard(index: int):
+def _sessions_keyboard(index: int, sessions: list):
+    """The «Сессии» screen: one tgp:s:<id> continue button per listed session
+    (tap = resume + bind the topic to it), a new-session button, the
+    all-sessions (desktop included) view, and back to the project list."""
     from telegram import InlineKeyboardButton, InlineKeyboardMarkup
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("⬅️ К списку проектов", callback_data=_BACK_CB),
-         InlineKeyboardButton("📋 Ещё раз", callback_data=f"{CB_PREFIX}l:{index}")],
+    rows = [
+        [InlineKeyboardButton(f"▶️ {str(s['id'])[:12]}… · {s.get('message_count', 0)} msg",
+                              callback_data=f"{CB_PREFIX}s:{s['id']}")]
+        for s in sessions
+    ]
+    rows.append([
+        InlineKeyboardButton("➕ Новая сессия", callback_data=f"{CB_PREFIX}n:{index}"),
+        InlineKeyboardButton("🖥️ Все сессии", callback_data=f"{CB_PREFIX}a:{index}"),
     ])
+    rows.append([InlineKeyboardButton("⬅️ К списку проектов", callback_data=_BACK_CB)])
+    return InlineKeyboardMarkup(rows)
 
 
 # ---------------------------------------------------- synthetic gateway message injection
@@ -1861,6 +1885,35 @@ async def _tg_on_button(update: Any, context: Any) -> None:
         await _handle_panel_callback(query, data)
         return
 
+    # Back to the project list (tgp:b) and list pagination (tgp:pl:<offset>).
+    if data == _BACK_CB:
+        try:
+            projects = _list_projects()
+        except Exception as exc:
+            logger.warning("tg-projects: projects.db read failed: %s", exc)
+            await query.answer()
+            with _suppress(Exception):
+                await query.edit_message_text(
+                    f"Не удалось прочитать проекты: {exc}",
+                    reply_markup=_back_keyboard(),
+                )
+            return
+        await _edit_project_list(query, projects, 0)
+        await query.answer()
+        return
+
+    m_pl = _CB_PL_RE.match(data)
+    if m_pl is not None:  # tgp:pl:<offset> — project list page
+        try:
+            projects = _list_projects()
+        except Exception as exc:
+            logger.warning("tg-projects: projects.db read failed: %s", exc)
+            await query.answer()
+            return
+        await _edit_project_list(query, projects, int(m_pl.group(1)))
+        await query.answer()
+        return
+
     m = _CB_SESSION_RE.match(data)
     if m is not None:  # tgp:s:<id> — continue a listed session
         await _do_resume_by_id(query, m.group(1))
@@ -1924,9 +1977,13 @@ async def _tg_on_button(update: Any, context: Any) -> None:
         with _suppress(Exception):
             await query.answer(str(exc))
     except Exception as exc:
-        logger.warning("tg-projects: button %r failed: %s", data, exc, exc_info=True)
-        with _suppress(Exception):
-            await query.answer("Ошибка — см. лог hermes")
+        # Re-rendering the very same screen (the old "Ещё раз" pattern) makes
+        # PTB raise BadRequest("Message is not modified") — that is success for
+        # the user, not an error: swallow it instead of "см. лог hermes".
+        if "not modified" not in str(exc).lower():
+            logger.warning("tg-projects: button %r failed: %s", data, exc, exc_info=True)
+            with _suppress(Exception):
+                await query.answer("Ошибка — см. лог hermes")
     finally:
         with _suppress(Exception):
             state_conn.close()
@@ -2163,18 +2220,18 @@ def _back_keyboard():
 
 
 def _all_sessions_keyboard(index: int, sessions: list):
-    """Continue buttons for the 'all sessions' view: one tgp:s:<id> per session,
-    plus back/re-list. Session ids ride in the callback data (each <= 64 bytes;
+    """Continue buttons for the 'all sessions' view: one tgp:s:<id> per session
+    (tap = resume + bind the topic to it), a new-session button, and back to
+    the project list. Session ids ride in the callback data (each <= 64 bytes;
     a timestamp-based id is ~21 chars, so tgp:s:<id> stays under the cap)."""
     from telegram import InlineKeyboardButton, InlineKeyboardMarkup
     rows = [
-        [InlineKeyboardButton(f"▶️ Продолжить {s['id'][:12]}…", callback_data=f"{CB_PREFIX}s:{s['id']}")]
+        [InlineKeyboardButton(f"▶️ {s['id'][:12]}… · {s.get('message_count', 0)} msg",
+                              callback_data=f"{CB_PREFIX}s:{s['id']}")]
         for s in sessions
     ]
-    rows.append([
-        InlineKeyboardButton("⬅️ К списку проектов", callback_data=_BACK_CB),
-        InlineKeyboardButton("📋 Ещё раз", callback_data=f"{CB_PREFIX}a:{index}"),
-    ])
+    rows.append([InlineKeyboardButton("➕ Новая сессия", callback_data=f"{CB_PREFIX}n:{index}")])
+    rows.append([InlineKeyboardButton("⬅️ К списку проектов", callback_data=_BACK_CB)])
     return InlineKeyboardMarkup(rows)
 
 
@@ -2293,6 +2350,18 @@ async def _do_resume(query, project, index_str: str, state_conn) -> None:
     await _send_gateway_command(query, f"/resume {target['id']}")
 
 
+async def _edit_project_list(query, projects: list, offset: int = 0) -> None:
+    """The project picker screen (the tgp:b back target and tgp:pl pages):
+    re-render the paginated project list in place."""
+    offset = max(0, int(offset or 0))
+    text = "Проекты — выберите каталог:"
+    if offset:
+        text = f"Проекты — страница {offset // _PROJECTS_PER_PAGE + 1}:"
+    with _suppress(Exception):
+        await query.edit_message_text(text,
+                                      reply_markup=_project_list_keyboard(projects, offset))
+
+
 async def _edit_sessions(query, projects: list, proj, index_str: str, state_conn) -> None:
     cwd = _project_cwd(proj)
     sessions = _sessions_for_cwd(state_conn, cwd, limit=5) if cwd else []
@@ -2312,9 +2381,12 @@ async def _edit_sessions(query, projects: list, proj, index_str: str, state_conn
             lines.append("")
             lines.append("⚠️ 🖥️ — сессия из десктопа; одновременная работа с двух сторон пишет историю из двух процессов.")
     lines.append("")
-    lines.append(f"Продолжить последнюю: /resume {sessions[0]['id']}" if sessions else "Продолжить: сессий нет")
-    lines.append(f"Больше (все десктопные, до 8): {CB_PREFIX}a:{index_str}")
-    await query.edit_message_text("\n".join(lines), reply_markup=_sessions_keyboard(int(index_str)))
+    if sessions:
+        lines.append("Тап по кнопке сессии ниже — продолжить её (и закрепить за топиком).")
+    else:
+        lines.append("Продолжить: сессий нет — создайте новую кнопкой ниже.")
+    await query.edit_message_text("\n".join(lines),
+                                  reply_markup=_sessions_keyboard(int(index_str), sessions))
 
 
 def _session_key_from_query(query) -> str:

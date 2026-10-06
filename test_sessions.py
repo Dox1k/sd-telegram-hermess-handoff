@@ -679,19 +679,46 @@ class CrossOriginTests(unittest.TestCase):
         self.assertIn("одной за раз", note)
 
 
-class AllSessionsKeyboardTests(unittest.TestCase):
+class ProjectListPaginationTests(unittest.TestCase):
+    """5+ projects paginate; tgp:p:<i> keeps the GLOBAL index across pages."""
+
+    def _projects(self, n):
+        return [_Project(f"p{i}", f"Prj{i}", f"prj{i}", f"/x/{i}") for i in range(1, n + 1)]
+
+    def test_short_list_has_no_ellipsis(self):
+        kb = mod._project_list_keyboard(self._projects(3))
+        self.assertEqual([r[0].callback_data for r in kb.rows[:3]],
+                         ["tgp:p:1", "tgp:p:2", "tgp:p:3"])
+        self.assertNotIn("tgp:pl:5", str(kb.rows))
+
+    def test_page_two_uses_global_indices(self):
+        kb = mod._project_list_keyboard(self._projects(7), offset=5)
+        self.assertEqual([r[0].callback_data for r in kb.rows[:2]],
+                         ["tgp:p:6", "tgp:p:7"])
+        self.assertIn("tgp:pl:0",
+                      [b.callback_data for row in kb.rows for b in row])  # back to start
+        rest = [b for row in kb.rows for b in row if "осталось" in str(b.text)]
+        self.assertEqual(len(rest), 0)  # exactly 2 on page 2 — no [Ещё] row
+
+    def test_six_projects_show_more_row(self):
+        kb = mod._project_list_keyboard(self._projects(6))
+        flat = [b.callback_data for row in kb.rows for b in row]
+        self.assertIn("tgp:pl:5", flat)
+
+
+
     """tgp:s:<id> continue buttons, one per listed session."""
 
     def test_one_button_per_session_plus_back(self):
         sessions = [{"id": "20261003_062445_2d0fd7"}, {"id": "sess-abc"}]
         kb = mod._all_sessions_keyboard("3", sessions)
         rows = kb.rows
-        self.assertEqual(len(rows), 3)
+        self.assertEqual(len(rows), 4)
         self.assertEqual(
             rows[0][0].callback_data, "tgp:s:20261003_062445_2d0fd7")
         self.assertEqual(rows[1][0].callback_data, "tgp:s:sess-abc")
-        self.assertEqual(rows[2][0].callback_data, mod._BACK_CB)
-        self.assertEqual(rows[2][1].callback_data, "tgp:a:3")
+        self.assertEqual(rows[2][0].callback_data, "tgp:n:3")  # ➕ Новая сессия
+        self.assertEqual(rows[3][0].callback_data, mod._BACK_CB)
 
     def test_all_session_callbacks_within_cap(self):
         # 58-char id + 6-char prefix "tgp:s:" = 64 bytes (the cap).
@@ -706,8 +733,9 @@ class AllSessionsKeyboardTests(unittest.TestCase):
 
     def test_empty_session_list_still_has_back_row(self):
         kb = mod._all_sessions_keyboard("1", [])
-        self.assertEqual(len(kb.rows), 1)
-        self.assertEqual(kb.rows[0][0].callback_data, mod._BACK_CB)
+        self.assertEqual(len(kb.rows), 2)
+        self.assertEqual(kb.rows[0][0].callback_data, "tgp:n:1")  # ➕ Новая сессия
+        self.assertEqual(kb.rows[1][0].callback_data, mod._BACK_CB)
 
 
 class ModelPickerThreadTests(unittest.TestCase):
