@@ -167,7 +167,7 @@ class _FakeStateDB:
         self.conn.execute(
             "CREATE TABLE sessions (id TEXT PRIMARY KEY, source TEXT, cwd TEXT,"
             " started_at REAL, message_count INTEGER, title TEXT, chat_id TEXT,"
-            " thread_id TEXT)")
+            " thread_id TEXT, ended_at REAL)")
         self.conn.execute(
             "CREATE TABLE messages (session_id TEXT, role TEXT, content TEXT)")
         self.conn.execute(
@@ -707,11 +707,12 @@ class ProjectListPaginationTests(unittest.TestCase):
 
 
 
-    """tgp:s:<id> continue buttons, one per listed session."""
+class SessionsKeyboardTests(unittest.TestCase):
+    """tgp:s:<id> continue buttons, one per live session (the single sessions view)."""
 
-    def test_one_button_per_session_plus_back(self):
-        sessions = [{"id": "20261003_062445_2d0fd7"}, {"id": "sess-abc"}]
-        kb = mod._all_sessions_keyboard("3", sessions)
+    def test_one_button_per_session_plus_new_and_back(self):
+        sessions = [{"id": "20261003_062445_2d0fd7", "title": "Проверка"}, {"id": "sess-abc"}]
+        kb = mod._sessions_keyboard("3", sessions)
         rows = kb.rows
         self.assertEqual(len(rows), 4)
         self.assertEqual(
@@ -720,10 +721,10 @@ class ProjectListPaginationTests(unittest.TestCase):
         self.assertEqual(rows[2][0].callback_data, "tgp:n:3")  # ➕ Новая сессия
         self.assertEqual(rows[3][0].callback_data, mod._BACK_CB)
 
-    def test_all_session_callbacks_within_cap(self):
+    def test_session_callbacks_within_cap(self):
         # 58-char id + 6-char prefix "tgp:s:" = 64 bytes (the cap).
         sessions = [{"id": "a" * 58}]
-        kb = mod._all_sessions_keyboard("1", sessions)
+        kb = mod._sessions_keyboard("1", sessions)
         self.assertLessEqual(
             len(kb.rows[0][0].callback_data.encode("utf-8")), 64)
         # the 64-char id would be 70 bytes, over the cap — the regex rejects it
@@ -731,8 +732,8 @@ class ProjectListPaginationTests(unittest.TestCase):
         self.assertIsNone(mod._CB_SESSION_RE.match("tgp:s:" + "a" * 64))
         self.assertIsNotNone(mod._CB_SESSION_RE.match("tgp:s:" + "a" * 58))
 
-    def test_empty_session_list_still_has_back_row(self):
-        kb = mod._all_sessions_keyboard("1", [])
+    def test_empty_session_list_still_has_new_and_back(self):
+        kb = mod._sessions_keyboard("1", [])
         self.assertEqual(len(kb.rows), 2)
         self.assertEqual(kb.rows[0][0].callback_data, "tgp:n:1")  # ➕ Новая сессия
         self.assertEqual(kb.rows[1][0].callback_data, mod._BACK_CB)

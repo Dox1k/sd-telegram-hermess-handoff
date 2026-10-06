@@ -1220,7 +1220,7 @@ def _sessions_for_cwd(state_conn, cwd: str, limit: int = 2, source: Optional[str
     rows = []
     try:
         sql = ("SELECT id, title, source, started_at, message_count FROM sessions "
-               "WHERE cwd = ? AND message_count > 0")
+               "WHERE cwd = ? AND message_count > 0 AND ended_at IS NULL")
         args: list = [cwd]
         if source:
             sql += " AND source = ?"
@@ -1796,10 +1796,9 @@ def _project_menu_keyboard(index: int, has_sessions: bool, has_cwd: bool):
     ]
     row2 = [
         InlineKeyboardButton("📋 Сессии", callback_data=f"{CB_PREFIX}l:{index}"),
-        InlineKeyboardButton("🖥️ Все сессии", callback_data=f"{CB_PREFIX}a:{index}"),
+        InlineKeyboardButton("⚙️ Модель", callback_data=f"{CB_PREFIX}d:{index}"),
     ]
     row3 = [
-        InlineKeyboardButton("⚙️ Модель", callback_data=f"{CB_PREFIX}d:{index}"),
         InlineKeyboardButton("⬅️ Назад", callback_data=_BACK_CB),
     ]
     del has_sessions, has_cwd  # the menu is the same regardless
@@ -1807,19 +1806,16 @@ def _project_menu_keyboard(index: int, has_sessions: bool, has_cwd: bool):
 
 
 def _sessions_keyboard(index: int, sessions: list):
-    """The «Сессии» screen: one tgp:s:<id> continue button per listed session
-    (tap = resume + bind the topic to it), a new-session button, the
-    all-sessions (desktop included) view, and back to the project list."""
+    """The «Сессии» screen: one tgp:s:<id> continue button per live session
+    (tap = resume + bind the topic to it), a new-session button, and back to
+    the project list."""
     from telegram import InlineKeyboardButton, InlineKeyboardMarkup
     rows = [
         [InlineKeyboardButton(f"▶️ {str(s.get('title') or '').strip() or (str(s['id'])[:12] + '…')} · {s.get('message_count', 0)} msg",
                               callback_data=f"{CB_PREFIX}s:{s['id']}")]
         for s in sessions
     ]
-    rows.append([
-        InlineKeyboardButton("➕ Новая сессия", callback_data=f"{CB_PREFIX}n:{index}"),
-        InlineKeyboardButton("🖥️ Все сессии", callback_data=f"{CB_PREFIX}a:{index}"),
-    ])
+    rows.append([InlineKeyboardButton("➕ Новая сессия", callback_data=f"{CB_PREFIX}n:{index}")])
     rows.append([InlineKeyboardButton("⬅️ К списку проектов", callback_data=_BACK_CB)])
     return InlineKeyboardMarkup(rows)
 
@@ -2082,10 +2078,6 @@ async def _tg_on_button(update: Any, context: Any) -> None:
             if project is None:
                 raise _ProjectMoved(f"Проект #{index_str} больше не в списке — закройте и выберите заново.")
             await _do_resume(query, project, index_str, state_conn)
-        elif action == "a":  # ALL sessions of the project (desktop included)
-            if project is None:
-                raise _ProjectMoved(f"Проект #{index_str} больше не в списке — закройте и выберите заново.")
-            await _edit_all_sessions(query, projects, project, index_str, state_conn)
         elif action == "d":  # model picker for the project
             if project is None:
                 raise _ProjectMoved(f"Проект #{index_str} больше не в списке — закройте и выберите заново.")
@@ -2278,32 +2270,6 @@ def _caller_source_value(session_source: str = "", source=None) -> str:
     return "telegram" if _ADAPTER is not None else ""
 
 
-async def _edit_all_sessions(query, projects: list, proj, index_str: str, state_conn) -> None:
-    """«Все сессии проекта»: up to 8 sessions of the project cwd (desktop included),
-    each with a continue button; a desktop session carries a two-process warning."""
-    cwd = _project_cwd(proj)
-    sessions = _sessions_for_cwd(state_conn, cwd, limit=8) if cwd else []
-    lines = [f"📋 Все сессии проекта #{index_str}: {proj.name}", ""]
-    if not cwd:
-        lines.append("каталог не указан")
-    elif not sessions:
-        lines.append("(нет сессий в этом каталоге)")
-    else:
-        has_desktop = any(s["source"] == "desktop" for s in sessions)
-        for s in sessions:
-            flag = "🖥️ " if s["source"] == "desktop" else ""
-            label = str(s.get("title") or "").strip() or str(s["id"])[:12] + "…"
-            lines.append(f"{flag}• {label} ({_fmt_ts(s['started_at'])}) {s['message_count']} msg — {_trim(s['last_message'], 40) or '(пусто)'}")
-        if has_desktop:
-            lines.append("")
-            lines.append("⚠️ 🖥️ — сессия создана в десктопе. Если она открыта и там, и на телефоне "
-                         "одновременно, история будет писаться из двух процессов — "
-                         "работайте с одной стороны за раз.")
-    kb = _all_sessions_keyboard(index_str, sessions)
-    with _suppress(Exception):
-        await query.edit_message_text("\n".join(lines), reply_markup=kb)
-
-
 async def _edit_new_project_guide(query) -> None:
     """The «Новый проект» button: step-by-step text for /pproject (callback_data
     is 64 bytes, so name + path cannot ride in the button itself)."""
@@ -2344,22 +2310,6 @@ def _back_keyboard():
     return InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ К списку проектов", callback_data=_BACK_CB)]])
 
 
-def _all_sessions_keyboard(index: int, sessions: list):
-    """Continue buttons for the 'all sessions' view: one tgp:s:<id> per session
-    (tap = resume + bind the topic to it), a new-session button, and back to
-    the project list. Session ids ride in the callback data (each <= 64 bytes;
-    a timestamp-based id is ~21 chars, so tgp:s:<id> stays under the cap)."""
-    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
-    rows = [
-        [InlineKeyboardButton(f"▶️ {str(s.get('title') or '').strip() or (s['id'][:12] + '…')} · {s.get('message_count', 0)} msg",
-                              callback_data=f"{CB_PREFIX}s:{s['id']}")]
-        for s in sessions
-    ]
-    rows.append([InlineKeyboardButton("➕ Новая сессия", callback_data=f"{CB_PREFIX}n:{index}")])
-    rows.append([InlineKeyboardButton("⬅️ К списку проектов", callback_data=_BACK_CB)])
-    return InlineKeyboardMarkup(rows)
-
-
 class _ProjectMoved(Exception):
     """Raised inside the button handler to surface a stale index to the user."""
 
@@ -2388,8 +2338,7 @@ def _menu_action_note(proj, cwd: str | None, sessions: list) -> str:
         notes.append(f"▶️ Продолжить — /resume {sessions[0]['id']} + каталог проекта")
     else:
         notes.append("▶️ Продолжить — у проекта пока нет сессий, ничего не будет сделано")
-    notes.append("📋 Сессии — последние 5 сессий этого каталога (только сессии с сообщением)")
-    notes.append("🖥️ Все сессии — до 8 сессий этого каталога, включая созданные в десктопе")
+    notes.append("📋 Сессии — живые (незавершённые) сессии этого каталога")
     notes.append("⚙️ Модель — пикер моделей /model для текущей сессии")
     return " | ".join(notes)
 
@@ -2757,9 +2706,7 @@ def _pb_panel_keyboard():
         [InlineKeyboardButton("📁 Проект", callback_data=f"{_PB_CB_PREFIX}proj"),
          InlineKeyboardButton("🧵 Сессия", callback_data=f"{_PB_CB_PREFIX}sess"),
          InlineKeyboardButton("➕ Новая", callback_data=f"{_PB_CB_PREFIX}new")],
-        [InlineKeyboardButton("▶️ Resume", callback_data=f"{_PB_CB_PREFIX}res"),
-         InlineKeyboardButton("⏹ Stop", callback_data=f"{_PB_CB_PREFIX}stop"),
-         InlineKeyboardButton("⚠️ Approvals", callback_data=f"{_PB_CB_PREFIX}appr"),
+        [InlineKeyboardButton("⏹ Stop", callback_data=f"{_PB_CB_PREFIX}stop"),
          InlineKeyboardButton("⚙️ Ещё", callback_data=f"{_PB_CB_PREFIX}more")],
     ])
 
@@ -2962,6 +2909,7 @@ async def _pb_sessions_screen(query, chat_id: str, thread_id: Optional[int]) -> 
                  f"{_pb_session_label(s)} · {s.get('status') or 'idle'}",
                  callback_data=f"{_PB_CB_PREFIX}sesss:{s['id']}")]
             for s in sessions]
+    rows.append([InlineKeyboardButton("➕ Новая сессия", callback_data=f"{_PB_CB_PREFIX}new")])
     rows.append([InlineKeyboardButton("⬅️ Назад", callback_data=f"{_PB_CB_PREFIX}back")])
     with _suppress(Exception):
         await query.edit_message_text(_pb_sessions_text(binding, sessions),
@@ -3010,19 +2958,6 @@ async def _pb_new_session(query, chat_id: str, thread_id: Optional[int]) -> None
     await _pb_render(query, chat_id, thread_id)
 
 
-async def _pb_resume(query, chat_id: str, thread_id: Optional[int]) -> None:
-    """[▶️ Resume]: /resume the bound session, or tell the user to pick one."""
-    binding = _pb_binding(chat_id, thread_id)
-    session_id = str((binding or {}).get("session_id") or "").strip()
-    if not session_id:
-        with _suppress(Exception):
-            await query.edit_message_text("▶️ Сначала выбери сессию: [🧵 Сессия].",
-                                          reply_markup=_pb_back_keyboard())
-        return
-    await _do_resume_by_id(query, session_id)
-    await _pb_render(query, chat_id, thread_id)
-
-
 async def _pb_stop(query) -> None:
     """[⏹ Stop]: /stop is a real gateway command (interrupt_then_dispatch), so a
     synthetic event stops the running turn of this chat's session in both idle
@@ -3037,20 +2972,6 @@ async def _pb_stop(query) -> None:
             "⏹ Останавливаю текущую сессию (/stop) — ответ придёт ниже.",
             reply_markup=_pb_back_keyboard())
     await _send_gateway_command(query, "/stop")
-
-
-async def _pb_approvals_screen(query) -> None:
-    """[⚠️ Approvals]: the exec-approval explanation screen."""
-    text = (
-        "⚠️ Подтверждения (approvals)\n\n"
-        "Кнопки одобрения («Разрешить»/«Отклонить») приходят в чат автоматически, "
-        "когда агент запускает опасную команду (shell, запись в файлы и т.п.). "
-        "Отвечайте на них прямо в сообщении с кнопками — отдельной настройки на "
-        "панели нет.\n\n"
-        "Если кнопка не нажимается — ответьте текстом в чат."
-    )
-    with _suppress(Exception):
-        await query.edit_message_text(text, reply_markup=_pb_back_keyboard())
 
 
 async def _pb_more_screen(query) -> None:
@@ -3096,12 +3017,8 @@ async def _handle_panel_callback(query, data: str) -> None:
             await _pb_sessions_screen(query, chat_id, thread_id)
         elif rest == "new":
             await _pb_new_session(query, chat_id, thread_id)
-        elif rest == "res":
-            await _pb_resume(query, chat_id, thread_id)
         elif rest == "stop":
             await _pb_stop(query)
-        elif rest == "appr":
-            await _pb_approvals_screen(query)
         elif rest == "more":
             await _pb_more_screen(query)
         else:

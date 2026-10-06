@@ -190,7 +190,7 @@ class _FakeStateDBSchema:
         self.conn.execute(
             "CREATE TABLE sessions (id TEXT PRIMARY KEY, source TEXT, cwd TEXT,"
             " started_at REAL, message_count INTEGER, title TEXT, chat_id TEXT,"
-            " thread_id TEXT)")
+            " thread_id TEXT, ended_at REAL)")
         self.conn.execute(
             "CREATE TABLE messages (session_id TEXT, role TEXT, content TEXT)")
         self.conn.execute(
@@ -549,7 +549,7 @@ class PanelCallbackTests(_StubbedTestCase):
         query = self._tap("tgp:pb:back")
         self.assertEqual(query.edits[0][0], f"📁  NeiroSlop\n🧵  —\n📂  {CWD}")
         self.assertEqual(query.edits[0][1].rows[0][0].callback_data, "tgp:pb:proj")
-        self.assertEqual(query.edits[0][1].rows[1][3].callback_data, "tgp:pb:more")
+        self.assertEqual(query.edits[0][1].rows[1][1].callback_data, "tgp:pb:more")
 
     def test_back_without_binding_shows_hint(self):
         query = self._tap("tgp:pb:back")
@@ -581,7 +581,7 @@ class PanelCallbackTests(_StubbedTestCase):
         query = self._tap("tgp:pb:sess")
         self.assertEqual(query.edits[0][0], "🧵 Сначала выбери проект: [📁 Проект].")
 
-    def test_sess_screen_lists_all_sessions_with_buttons(self):
+    def test_sess_screen_lists_live_sessions_with_buttons(self):
         _STATE_DATA["topic_bindings"] = {KEY: _binding_entry(None)}
         _seed_session(SID, lease_until=time.time() + 300)
         _seed_session("20261002_101500_0d0fd7", source="desktop", count=5)
@@ -589,9 +589,18 @@ class PanelCallbackTests(_StubbedTestCase):
         rows = query.edits[0][1].rows
         self.assertEqual(rows[0][0].callback_data, f"tgp:pb:sesss:{SID}")
         self.assertEqual(rows[1][0].callback_data, "tgp:pb:sesss:20261002_101500_0d0fd7")
+        self.assertEqual(rows[-2][0].callback_data, "tgp:pb:new")  # ➕ Новая сессия
         self.assertEqual(rows[-1][0].callback_data, "tgp:pb:back")
         self.assertIn("online", query.edits[0][0])
         self.assertIn("🖥️", query.edits[0][0])
+
+    def test_sess_screen_no_sessions_still_offers_new(self):
+        _STATE_DATA["topic_bindings"] = {KEY: _binding_entry(None)}
+        query = self._tap("tgp:pb:sess")
+        rows = query.edits[0][1].rows
+        self.assertEqual(rows[0][0].callback_data, "tgp:pb:new")
+        self.assertEqual(rows[1][0].callback_data, "tgp:pb:back")
+        self.assertIn("нет сессий", query.edits[0][0])
 
     def test_sesss_pick_sets_session_and_sends_resume(self):
         _STATE_DATA["topic_bindings"] = {KEY: _binding_entry(None)}
@@ -630,22 +639,6 @@ class PanelCallbackTests(_StubbedTestCase):
         self.assertEqual(query.edits[-1][0], f"📁  NeiroSlop\n🧵  —\n📂  {CWD}")
         self.assertIsNotNone(query.edits[-1][1])
 
-    def test_res_without_session_shows_hint(self):
-        _STATE_DATA["topic_bindings"] = {KEY: _binding_entry(None)}
-        query = self._tap("tgp:pb:res")
-        self.assertIn("Сначала выбери сессию", query.edits[0][0])
-        self.assertEqual(self.adapter.events, [])
-
-    def test_res_resumes_bound_session(self):
-        _STATE_DATA["topic_bindings"] = {KEY: _binding_entry(SID)}
-        _seed_session(SID)
-        with _with_env(HERMES_HOME="/nonexistent-panel-tmp"):
-            query = self._tap("tgp:pb:res")
-        self.assertTrue(any(getattr(e, "text", "") == f"/resume {SID}"
-                            for e in self.adapter.events))
-        self.assertEqual(query.edits[-1][0],
-                         f"📁  NeiroSlop\n🧵  20261003_062… · idle\n📂  {CWD}")
-
     def test_stop_sends_stop_command(self):
         _STATE_DATA["topic_bindings"] = {KEY: _binding_entry(SID)}
         query = self._tap("tgp:pb:stop")
@@ -659,11 +652,6 @@ class PanelCallbackTests(_StubbedTestCase):
         _run(mod._handle_panel_callback(query, "tgp:pb:stop"))
         self.assertIn("недоступна", query.edits[0][0])
         self.assertEqual(self.adapter.events, [])
-
-    def test_appr_screen_explains(self):
-        query = self._tap("tgp:pb:appr")
-        self.assertIn("Подтверждения", query.edits[0][0])
-        self.assertEqual(query.edits[0][1].rows[0][0].callback_data, "tgp:pb:back")
 
     def test_more_screen_lists_commands(self):
         query = self._tap("tgp:pb:more")
