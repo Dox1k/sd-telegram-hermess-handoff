@@ -345,6 +345,11 @@ def _reset_state():
     _STATE.data = {"pending_cwd": {}, "thread_to_project": {}}
 
 
+def asyncio_run(coro):
+    import asyncio as _asyncio
+    return _asyncio.run(coro)
+
+
 class FakeSource:
     def __init__(self, user_id="111"):
         self.user_id = user_id
@@ -730,6 +735,43 @@ class ProjectListPaginationTests(unittest.TestCase):
         flat = [b.callback_data for row in kb.rows for b in row]
         self.assertIn("tgp:pl:5", flat)
 
+
+
+class SyncHookFlatTests(unittest.TestCase):
+    """pre_gateway_dispatch sync: a project-bound flat lane never blocks text."""
+
+    def setUp(self):
+        _reset_state()
+
+    def _event(self, text):
+        src = types.SimpleNamespace(
+            platform=types.SimpleNamespace(value="telegram"),
+            chat_type="dm", chat_id="7559860199",
+            thread_id=None, user_id="7559860199")
+        return types.SimpleNamespace(source=src, text=text, internal=False)
+
+    def _bind_flat(self):
+        _STATE.data["topic_bindings"] = {"7559860199:0": {
+            "project_id": "p1", "project_name": "SD1",
+            "cwd": "/mnt/mydisk/sd1", "session_id": None,
+            "updated_at": 1791315530}}
+
+    def test_project_without_session_lets_text_through(self):
+        # Regression: binding has the project but session_id is still empty
+        # (right after /new, before the first turn) — blocking here returned
+        # "выбери проект" and deadlocked the first turn.
+        self._bind_flat()
+        result = asyncio_run(mod._on_pre_gateway_dispatch_sync(self._event("привет"), None))
+        self.assertIsNone(result)
+
+    def test_no_binding_at_all_still_redirects_to_menu(self):
+        result = asyncio_run(mod._on_pre_gateway_dispatch_sync(self._event("привет"), None))
+        self.assertEqual(result, {"action": "skip", "reason": "unbound_topic"})
+
+    def test_command_and_non_dm_flow_untouched(self):
+        self._bind_flat()
+        self.assertIsNone(
+            asyncio_run(mod._on_pre_gateway_dispatch_sync(self._event("/menu"), None)))
 
 
 class SessionsKeyboardTests(unittest.TestCase):

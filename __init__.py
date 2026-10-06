@@ -519,8 +519,8 @@ async def _on_pre_gateway_dispatch_sync(event, gateway, session_store=None, **kw
             tid = 0  # topic-less DM (topics off): the chat's single flat lane
 
         binding = _binding_at(chat_id, tid)
-        bound_sid = str((binding or {}).get("session_id") or "").strip()
-        if not bound_sid:
+        if not binding or not str(binding.get("cwd") or "").strip():
+            # No project bound at all → the classic "choose a project" reply.
             key = f"{chat_id}:{tid}"
             now = time.time()
             if now - _SYNC_WARNED.get(key, 0.0) >= _SYNC_WARN_EVERY_S:
@@ -531,6 +531,14 @@ async def _on_pre_gateway_dispatch_sync(event, gateway, session_store=None, **kw
                 with _suppress(Exception):
                     _panel(chat_id, tid)
             return {"action": "skip", "reason": "unbound_topic"}
+
+        # Project bound, session not yet recorded: let the text through —
+        # the first turn creates/starts the lane session and on_session_start
+        # records its id in the binding. Blocking here deadlocked the flow
+        # ("выбери проект" right after /new).
+        bound_sid = str(binding.get("session_id") or "").strip()
+        if not bound_sid:
+            return None
 
         # Bound topic: steer the lane onto binding.session_id when drifted.
         store = session_store if session_store is not None else getattr(
