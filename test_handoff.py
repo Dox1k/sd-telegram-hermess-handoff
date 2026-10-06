@@ -1,0 +1,328 @@
+"""Unit tests for tg-projects handoff (cross-device session switching).
+
+Run:  python3 /home/meow/.hermes/plugins/tg-projects/test_handoff.py
+No network, no Telegram, no getUpdates, no writes to the real state.db —
+state.json is stubbed and the lease helpers are tested against temp sqlite
+files that mimic the session_turn_leases table.
+"""
+import asyncio
+import importlib.util
+import json
+import os
+import sqlite3
+import sys
+import tempfile
+import time
+import types
+import unittest
+from pathlib import Path
+
+PLUGIN_DIR = Path("/home/meow/.hermes/plugins/tg-projects")
+
+# device_sessions must import cleanly standalone (it is a dependency of handoff)
+sys.path.insert(0, str(PLUGIN_DIR))
+
+# Load handoff as a standalone module (same loader trick the plugin uses).
+spec = importlib.util.spec_from_file_location("tg_projects_handoff", str(PLUGIN_DIR / "handoff.py"))
+handoff = importlib.util.module_from_spec(spec)
+sys.modules.setdefault("tg_projects_handoff", handoff)
+spec.loader.exec_module(handoff)
+device_sessions = handoff.device_sessions
+
+
+class _TempHome:
+    """Point HERMES_HOME and the plugin dir state at temp paths."""
+
+    def __init__(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.home = Path(self.tmp.name) / "home"
+        self.home.mkdir()
+        handoff._STATE_FILE = Path(self.tmp.name) / "state.json"
+        handoff._EVENTS_FILE = Path(self.tmp.name) / "handoff_events.jsonl"
+        handoff._PLUG_DIR = Path(self.tmp.name)
+        device_sessions._DB_FILE = Path(self.tmp.name) / "device_sessions.db"
+        device_sessions.reset_for_tests()
+        self.saved_env = os.environ.get("HERMES_HOME")
+        os.environ["HERMES_HOME"] = str(self.home)
+
+    def restore(self):
+        if self.saved_env is None:
+            os.environ.pop("HERMES_HOME", None)
+        else:
+            os.environ["HERMES_HOME"] = self.saved_env
+        device_sessions.reset_for_tests()
+        self.tmp.cleanup()
+
+    def state(self) -> dict:
+        if handoff._STATE_FILE.exists():
+            return json.loads(handoff._STATE_FILE.read_text(encoding="utf-8"))
+        return {}
+
+
+def _lease_db(path: Path, rows):
+    conn = sqlite3.connect(str(path))
+    conn.row_factory = sqlite3.Row
+    conn.execute("CREATE TABLE session_turn_leases ("
+                 "conversation_id TEXT PRIMARY KEY, holder TEXT NOT NULL, "
+                 "acquired_at REAL NOT NULL, expires_at REAL NOT NULL)")
+    for cid, holder, exp in rows:
+        conn.execute("INSERT INTO session_turn_leases VALUES (?,?,?,?)",
+                     (cid, holder, time.time(), exp))
+    conn.commit()
+    return conn
+
+
+class HolderParsingTests(unittest.TestCase):
+    def test_platform_token(self):
+        self.assertEqual(
+            handoff.parse_holder_platform(
+                "pid=840408:turn=x:14f52bf3:platform=desktop"), "desktop")
+        self.assertEqual(handoff.parse_holder_platform("pid=1:platform=telegram"), "telegram")
+        self.assertEqual(handoff.parse_holder_platform("no-token"), "")
+
+
+class ForeignLeaseTests(unittest.TestCase):
+    def setUp(self):
+        self._t = _TempHome()
+        self.db_path = self._t.home / "state.db"
+
+    def tearDown(self):
+        self._t.restore()
+
+    def _conn(self, rows):
+        return _lease_db(self.db_path, rows)
+
+    def test_fresh_desktop_lease_detected(self):
+        conn = self._conn([("s1", "pid=1:platform=desktop", time.time() + 120)])
+        lease = handoff.foreign_running_lease(conn, "s1")
+        self.assertIsNotNone(lease)
+        self.assertEqual(lease["platform"], "desktop")
+        conn.close()
+
+    def test_telegram_lease_is_own_surface(self):
+        conn = self._conn([("s1", "pid=1:platform=telegram", time.time() + 120)])
+        self.assertIsNone(handoff.foreign_running_lease(conn, "s1"))
+        conn.close()
+
+    def test_expired_lease_ignored(self):
+        conn = self._conn([("s1", "pid=1:platform=desktop", time.time() - 3600)])
+        self.assertIsNone(handoff.foreign_running_lease(conn, "s1"))
+        conn.close()
+
+    def test_missing_table_returns_none(self):
+        conn = sqlite3.connect(":memory:")
+        self.assertIsNone(handoff.foreign_running_lease(conn, "s1"))
+        conn.close()
+
+    def test_should_prompt_only_for_telegram_side(self):
+        conn = self._conn([("s1", "pid=1:platform=desktop", time.time() + 120)])
+        self.assertIsNotNone(handoff.should_prompt(conn, "s1", "telegram"))
+        self.assertIsNone(handoff.should_prompt(conn, "s1", "desktop"))
+        conn.close()
+
+
+class StealLeaseTests(unittest.TestCase):
+    def setUp(self):
+        self._t = _TempHome()
+        self.db_path = self._t.home / "state.db"
+
+    def tearDown(self):
+        self._t.restore()
+
+    def test_steal_removes_foreign_row(self):
+        conn = _lease_db(self.db_path, [("s1", "pid=9:platform=desktop", time.time() + 300)])
+        conn.close()
+        self.assertTrue(handoff.steal_lease("s1"))
+        check = sqlite3.connect(str(self.db_path))
+        self.assertIsNone(check.execute(
+            "SELECT 1 FROM session_turn_leases WHERE conversation_id='s1'").fetchone())
+        check.close()
+
+    def test_steal_never_touches_own_telegram_lease(self):
+        conn = _lease_db(self.db_path, [("s1", "pid=9:platform=telegram", time.time() + 300)])
+        conn.close()
+        self.assertFalse(handoff.steal_lease("s1"))
+        check = sqlite3.connect(str(self.db_path))
+        self.assertIsNotNone(check.execute(
+            "SELECT 1 FROM session_turn_leases WHERE conversation_id='s1'").fetchone())
+        check.close()
+
+    def test_steal_missing_row_is_false(self):
+        self.assertFalse(handoff.steal_lease("nope"))
+
+    def test_steal_missing_db_is_false(self):
+        self.assertFalse(handoff.steal_lease("s1"))
+
+
+class PendingTests(unittest.TestCase):
+    def setUp(self):
+        self._t = _TempHome()
+
+    def tearDown(self):
+        self._t.restore()
+
+    def test_store_and_pop_roundtrip(self):
+        handoff.store_pending("sk1", "s1", "привет", {"chat_id": "5", "user_id": "7"})
+        entry = handoff.pop_pending("sk1")
+        self.assertEqual(entry["session_id"], "s1")
+        self.assertEqual(entry["text"], "привет")
+        self.assertEqual(entry["source"]["chat_id"], "5")
+        # popped: a second pop is empty
+        self.assertIsNone(handoff.pop_pending("sk1"))
+
+    def test_stale_pending_dropped(self):
+        handoff.store_pending("sk1", "s1", "x", {})
+        state = self._t.state()
+        state["handoff_pending"]["sk1"]["ts"] = int(time.time()) - 999999
+        handoff._STATE_FILE.write_text(json.dumps(state), encoding="utf-8")
+        self.assertIsNone(handoff.pop_pending("sk1"))
+
+    def test_drop_pending(self):
+        handoff.store_pending("sk1", "s1", "x", {})
+        handoff.drop_pending("sk1")
+        self.assertIsNone(handoff.pop_pending("sk1"))
+        self.assertNotIn("handoff_pending", self._t.state())
+
+    def test_empty_text_not_stored(self):
+        self.assertFalse(handoff.store_pending("sk1", "s1", "   ", {}))
+        self.assertFalse(handoff.store_pending("", "s1", "x", {}))
+
+
+class NotifyDesktopTests(unittest.TestCase):
+    def setUp(self):
+        self._t = _TempHome()
+
+    def tearDown(self):
+        self._t.restore()
+
+    def test_event_appended_as_jsonl(self):
+        ok = handoff.notify_desktop_handoff("s1", "desktop", "telegram", extra={"text": "hi"})
+        self.assertTrue(ok)
+        line = handoff._EVENTS_FILE.read_text(encoding="utf-8").strip().splitlines()[0]
+        evt = json.loads(line)
+        self.assertEqual(evt["type"], "session.handoff")
+        self.assertEqual(evt["session_id"], "s1")
+        self.assertEqual(evt["from_device"], "desktop")
+        self.assertEqual(evt["to_device"], "telegram")
+        self.assertEqual(evt["text"], "hi")
+
+
+class PerformHandoffTests(unittest.TestCase):
+    def setUp(self):
+        self._t = _TempHome()
+        self.db_path = self._t.home / "state.db"
+        self._lease_conn = _lease_db(
+            self.db_path, [("s1", "pid=9:platform=desktop", time.time() + 300)])
+        self._lease_conn.close()
+        handoff.store_pending("sk1", "s1", "продолжай", {"chat_id": "5", "user_id": "7"})
+
+    def tearDown(self):
+        self._t.restore()
+
+    def test_handoff_steals_claim_notifies(self):
+        pending = asyncio.run(handoff.perform_handoff("sk1", "s1"))
+        self.assertEqual(pending["text"], "продолжай")
+        # lease gone
+        check = sqlite3.connect(str(self.db_path))
+        self.assertIsNone(check.execute(
+            "SELECT 1 FROM session_turn_leases WHERE conversation_id='s1'").fetchone())
+        check.close()
+        # claimed for telegram
+        self.assertEqual(device_sessions.lookup("s1")["device"], "telegram")
+        # desktop event recorded
+        self.assertIn("session.handoff", handoff._EVENTS_FILE.read_text(encoding="utf-8"))
+
+    def test_handoff_requires_pending(self):
+        self.assertIsNone(asyncio.run(handoff.perform_handoff("sk-other", "s1")))
+
+    def test_handoff_stale_session_mismatch_is_refused(self):
+        handoff.store_pending("sk2", "s-other", "x", {})
+        self.assertIsNone(asyncio.run(handoff.perform_handoff("sk2", "s1")))
+
+
+class CallbackRecognitionTests(unittest.TestCase):
+    def test_is_handoff_callback(self):
+        self.assertTrue(handoff.is_handoff_callback("tgp:ho:20261003_225921_f8d1e0:y"))
+        self.assertTrue(handoff.is_handoff_callback("tgp:ho:20261003_225921_f8d1e0:n"))
+        self.assertFalse(handoff.is_handoff_callback("tgp:s:20261003_225921_f8d1e0"))
+        self.assertFalse(handoff.is_handoff_callback("tgp:p:1"))
+        self.assertFalse(handoff.is_handoff_callback("tgp:ho:short:y"))
+
+
+class HookFailOpenTests(unittest.TestCase):
+    """on_pre_gateway_dispatch must never raise into the gateway."""
+
+    def setUp(self):
+        self._t = _TempHome()
+
+    def tearDown(self):
+        self._t.restore()
+
+    def _event(self, text="hi", platform="telegram", chat_type="dm", internal=False):
+        src = types.SimpleNamespace(
+            platform=types.SimpleNamespace(value=platform),
+            chat_id="5", thread_id="", user_id="7", chat_type=chat_type)
+        return types.SimpleNamespace(source=src, text=text, internal=internal, message_id="1")
+
+    def _gateway(self, session_id="s1"):
+        store = types.SimpleNamespace(
+            lookup_by_session_key=lambda sk: types.SimpleNamespace(session_id=session_id))
+        return types.SimpleNamespace(
+            session_store=store,
+            _generate_session_key=lambda src: "sk-lane",
+            async_session_store=None)
+
+    def test_idle_message_flows_through(self):
+        # no leases table at all → no foreign lease → allow (None)
+        result = asyncio.run(handoff.on_pre_gateway_dispatch(
+            self._event(), self._gateway(), None))
+        self.assertIsNone(result)
+
+    def test_command_not_intercepted(self):
+        result = asyncio.run(handoff.on_pre_gateway_dispatch(
+            self._event(text="/stop"), self._gateway(), None))
+        self.assertIsNone(result)
+
+    def test_non_telegram_ignored(self):
+        result = asyncio.run(handoff.on_pre_gateway_dispatch(
+            self._event(platform="discord"), self._gateway(), None))
+        self.assertIsNone(result)
+
+    def test_internal_redispatch_ignored(self):
+        result = asyncio.run(handoff.on_pre_gateway_dispatch(
+            self._event(internal=True), self._gateway(), None))
+        self.assertIsNone(result)
+
+    def test_group_chat_ignored(self):
+        result = asyncio.run(handoff.on_pre_gateway_dispatch(
+            self._event(chat_type="group"), self._gateway(), None))
+        self.assertIsNone(result)
+
+    def test_busy_prompts_and_skips(self):
+        conn = _lease_db(self._t.home / "state.db",
+                         [("s1", "pid=1:platform=desktop", time.time() + 300)])
+        store = types.SimpleNamespace(
+            lookup_by_session_key=lambda sk: types.SimpleNamespace(session_id="s1"))
+        gateway = types.SimpleNamespace(
+            session_store=store, _generate_session_key=lambda src: "sk-lane",
+            async_session_store=None)
+        # native/adapter unavailable → prompt send fails silently, hook still skips
+        result = asyncio.run(handoff.on_pre_gateway_dispatch(
+            self._event(), gateway, store))
+        self.assertEqual(result, {"action": "skip", "reason": "busy_elsewhere"})
+        # pending message stored
+        entry = handoff.pop_pending("sk-lane")
+        self.assertEqual(entry["text"], "hi")
+        conn.close()
+
+    def test_exceptions_fail_open(self):
+        class _Boom:
+            @property
+            def source(self):
+                raise RuntimeError("boom")
+        result = asyncio.run(handoff.on_pre_gateway_dispatch(_Boom(), None, None))
+        self.assertIsNone(result)
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
