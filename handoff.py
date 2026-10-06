@@ -37,11 +37,12 @@ import json
 import logging
 import os
 import re
+import secrets
 import sqlite3
 import sys
 import time
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 logger = logging.getLogger("hermes_plugins.tg_projects.handoff")
 
@@ -54,9 +55,14 @@ PENDING_TTL_S = 600
 # How long a "busy" prompt's Yes may act after the foreign lease disappeared
 # on its own (turn finished meanwhile) — still fine to just continue.
 LEASE_GRACE_S = 30
+# Lifetime of a pending handoff token (a "Да/Нет" tap that never lands).
+_TOKEN_TTL_S = 3600
 
 _HOLDER_PLATFORM_RE = re.compile(r"platform=([a-z_]+)")
-_CB_HO_RE = re.compile(r"^tgp:ho:([A-Za-z0-9_\-]{8,58}):(y|n)$")
+# 8-hex-char opaque token, so ``tgp:ho:<token>:(y|n)`` is always 9+8 = 17 bytes
+# and comfortably inside Telegram's 64-byte callback_data cap. The real
+# session_id / session_key live in state.json under ``handoff_tokens``.
+_CB_HO_RE = re.compile(r"^tgp:ho:([a-f0-9]{8}):(y|n)$")
 
 
 def _load_sibling(name: str):
@@ -105,6 +111,63 @@ def _save_state(state: dict) -> None:
     tmp = _STATE_FILE.with_suffix(".tmp")
     tmp.write_text(json.dumps(state, ensure_ascii=False, indent=1), encoding="utf-8")
     os.replace(tmp, _STATE_FILE)
+
+
+# ------------------------------------------------------------ handoff tokens
+def _make_token() -> str:
+    """Fresh 8-char hex token for callback_data (< 64-byte Telegram cap)."""
+    return secrets.token_hex(4)  # 8 hex chars = 32 bits
+
+
+def register_token(session_id: str, session_key: str) -> str:
+    """Store a new ``token -> (session_id, session_key)`` mapping; return the token.
+
+    Returns an empty string when *session_id* is unusable — callers must
+    treat that as "cannot register" and fall back to fail-open.
+    """
+    sid = str(session_id or "").strip()
+    if not sid:
+        return ""
+    token = _make_token()
+    state = _load_state()
+    now = int(time.time())
+    tokens = state.get("handoff_tokens") or {}
+    # Prune entries older than _TOKEN_TTL_S so the bucket cannot grow
+    # unboundedly across many parked-but-never-answered prompts.
+    tokens = {t: e for t, e in tokens.items()
+              if isinstance(e, dict) and int(e.get("ts") or 0) + _TOKEN_TTL_S > now}
+    tokens[token] = {
+        "session_id": sid,
+        "session_key": str(session_key or ""),
+        "ts": now,
+    }
+    state["handoff_tokens"] = tokens
+    _save_state(state)
+    return token
+
+
+def consume_token(token: str) -> Optional[Tuple[str, str]]:
+    """Return ``(session_id, session_key)`` for a live *token* and delete it.
+
+    The row is consumed on first read so a second tap on the same button
+    (double-click, or a stale keyboard in another chat) yields None and
+    hits the "expired" reply in the callback handler.
+    """
+    tok = str(token or "").strip()
+    if not tok:
+        return None
+    state = _load_state()
+    tokens = state.get("handoff_tokens") or {}
+    entry = tokens.pop(tok, None)
+    if entry is not None:
+        if not tokens:
+            state.pop("handoff_tokens", None)
+        _save_state(state)
+    if not isinstance(entry, dict):
+        return None
+    if int(entry.get("ts") or 0) + _TOKEN_TTL_S < time.time():
+        return None  # stale — user sat on the prompt too long
+    return (str(entry.get("session_id") or ""), str(entry.get("session_key") or ""))
 
 
 def _state_db_path() -> Path:
@@ -339,7 +402,7 @@ async def _hook_impl(event, gateway, session_store):
                               surface=str(getattr(source, "chat_id", "") or ""))
         return None
 
-    # Busy on another device: park the message and ask.
+    # Busy on another device: park the message and ask for confirmation.
     sk = _generate_session_key(gateway, source)
     if not sk:
         return None  # cannot key the pending message — fail-open
@@ -352,7 +415,12 @@ async def _hook_impl(event, gateway, session_store):
     })
     if not stored:
         return None  # state.json unwritable — fail-open
-    await _send_prompt(source, session_id, lease)
+    sent = await _send_prompt(source, session_id, sk, lease)
+    if not sent:
+        logger.error(
+            "tg-projects handoff: prompt undeliverable for session %s — message "
+            "parked in state.json but the user got no buttons; they must wait "
+            "for the other device to finish or /stop.", session_id)
     return {"action": "skip", "reason": "busy_elsewhere"}
 
 
@@ -382,14 +450,33 @@ def _generate_session_key(gateway, source) -> str:
     return ""
 
 
-async def _send_prompt(source, session_id: str, lease: Dict[str, Any]) -> None:
+async def _send_prompt(source, session_id: str, session_key: str,
+                       lease: Dict[str, Any]) -> bool:
     """Send the Yes/No prompt into the chat the message came from.
 
+    Registers a short-lived token BEFORE the buttons go out — the callback
+    data only carries the token (8 hex chars, so ``tgp:ho:<token>:(y|n)``
+    is always ≤ 17 bytes and safely inside Telegram's 64-byte cap). The
+    real ``session_id`` / ``session_key`` are looked up from
+    ``state.json['handoff_tokens']`` when the user taps.
+
     Uses the PTB bot directly (the plugin's wired ``_NATIVE``) so the inline
-    keyboard rides along; without a wired bot it degrades to adapter.send
-    plain text with instructions, and if even that fails the pending message
-    simply sits until the next attempt.
+    keyboard rides along; without a wired bot it degrades to
+    ``adapter.send`` plain text with instructions.
+
+    Returns True when at least one channel delivered the prompt; False when
+    both failed — caller should log the "parked with no prompt" condition.
     """
+    chat_id = getattr(source, "chat_id", None)
+    if chat_id is None:
+        logger.warning("tg-projects handoff: prompt skipped — no chat_id on source")
+        return False
+    token = register_token(session_id, session_key)
+    if not token:
+        logger.warning("tg-projects handoff: prompt skipped — token registration "
+                       "failed for %s", session_id)
+        return False
+
     platform_label = {"desktop": "ПК", "unknown": "другом устройстве"}.get(
         lease.get("platform", "unknown"), "другом устройстве")
     text = (
@@ -397,34 +484,42 @@ async def _send_prompt(source, session_id: str, lease: Dict[str, Any]) -> None:
         f"Остановить её там и продолжить здесь? Ваше сообщение сохранено и будет "
         f"отправлено после переключения."
     )
-    chat_id = getattr(source, "chat_id", None)
-    if chat_id is None:
-        return
+
+    thread_id = str(getattr(source, "thread_id", "") or "").strip()
+    thread_kwargs: Dict[str, Any] = ({"message_thread_id": int(thread_id)}
+                                     if thread_id.isdigit() else {})
+
     native = _get_native()
     if native is not None and getattr(native, "bot", None) is not None:
         try:
             from telegram import InlineKeyboardButton, InlineKeyboardMarkup
             keyboard = InlineKeyboardMarkup([
                 [InlineKeyboardButton("✅ Да, остановить и продолжить",
-                                      callback_data=f"tgp:ho:{session_id}:y"),
-                 InlineKeyboardButton("❌ Нет", callback_data=f"tgp:ho:{session_id}:n")],
+                                      callback_data=f"tgp:ho:{token}:y"),
+                 InlineKeyboardButton("❌ Нет", callback_data=f"tgp:ho:{token}:n")],
             ])
-            kwargs: Dict[str, Any] = {"chat_id": chat_id, "text": text,
-                                      "reply_markup": keyboard}
-            thread_id = str(getattr(source, "thread_id", "") or "").strip()
-            if thread_id and thread_id.isdigit():
-                kwargs["message_thread_id"] = int(thread_id)
-            await native.bot.send_message(**kwargs)
-            return
+            await native.bot.send_message(
+                chat_id=chat_id, text=text, reply_markup=keyboard, **thread_kwargs)
+            return True
         except Exception:
-            logger.warning("tg-projects handoff: prompt send failed", exc_info=True)
+            logger.warning("tg-projects handoff: native prompt send failed, "
+                           "trying adapter fallback", exc_info=True)
+
     adapter = _get_adapter()
     if adapter is not None:
         try:
-            await adapter.send(str(chat_id), text + "\n(Кнопки недоступны — "
-                                "перехватите вручную: ответьте Да следующим сообщением.)")
+            # adapter.send routes forum topics via metadata["thread_id"]
+            # (telegram adapter._metadata_thread_id, adapter.py:1094).
+            await adapter.send(str(chat_id),
+                               text + "\n(Кнопки недоступны — нажмите на панель "
+                                      "топика или ответьте 'Да' вручную.)",
+                               metadata={"thread_id": thread_id} if thread_id else None)
+            return True
         except Exception:
-            logger.warning("tg-projects handoff: prompt fallback send failed", exc_info=True)
+            logger.warning("tg-projects handoff: adapter fallback prompt failed",
+                           exc_info=True)
+
+    return False
 
 
 def _get_native():

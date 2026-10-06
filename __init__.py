@@ -69,17 +69,20 @@ New session / continue
 State
   ~/.hermes/plugins/tg-projects/state.json
     {
+     "topic_bindings": {"<chat_id>:<thread_id>": {"project_id", "project_name", "cwd", "session_id", "updated_at"}},
      "pending_cwd": {"<session_key>": {"project_id", "name", "slug", "cwd", "ts"}},
      "thread_to_project": {"<thread_id>": {"project_id", "name", "slug", "cwd", "ts"}}
     }
-  pending_cwd is the /pnew / "new session" pin, keyed by the chat's session key.
-  thread_to_project is the plugin's OWN topic -> project map for topics created
-  by /pproject: the Telegram adapter creates the topic but keeps no project
-  association (its dm_topics config only holds name/thread_id/chat_id), so this
-  plugin stores the mapping here instead of writing config.yaml.
-  _topic_name_by_thread resolves a thread_id against state.json first and
-  config.yaml's dm_topics as the fallback, so a plugin-created topic keeps its
-  cwd binding without touching the gateway config.
+  topic_bindings is the topic -> workplace map (step 3): a topic is a working
+  place = (project_id, cwd, optional session_id). on_session_start /
+  pre_llm_call take the cwd ONLY from here; a topic without a binding gets a
+  "bind this topic" warning instead of a silently default-/home directory.
+  pending_cwd is the /pnew / "new session" pin, keyed by the chat's session
+  key — legacy fallback for lanes that never got a topic binding.
+  thread_to_project is the DEPRECATED pre-binding topic -> project map:
+  read ONLY as the last-resort fallback for topics that never got a
+  topic_binding (no config.yaml dm_topics reads — that is the core
+  adapter's layer).
 
 Hook wiring
   ``on_session_start`` is a real Hermes plugin hook
@@ -98,20 +101,20 @@ read-only), and the platform adapter's ``_callback_ctx`` /
 ``_callback_authorized`` / ``_accept_update`` / ``handle_message`` /
 ``build_source``.
 
-Topic -> project cwd
-  A session bound to a private-chat Telegram topic gets its cwd automatically:
-  ``HERMES_SESSION_THREAD_ID`` is matched against
-  ``platforms.telegram.extra.dm_topics[*].topics[*].thread_id`` in
-  config.yaml (read-only, cached by mtime), the topic ``name`` is matched to a
-  project name (case-insensitive, slug fallback), and the project's
-  ``primary_path`` is registered for the session id. ``/pnew`` and the "new
-  session" button pin take priority. ``on_session_start`` covers new sessions;
-  the idempotent ``pre_llm_call`` hook covers the rest (a topic's first
-  session without a pin, ``/resume``'d sessions).
+Topic -> workplace cwd (step 3)
+  A topic IS a working place: ``state.json["topic_bindings"]`` maps
+  ``"<chat_id>:<thread_id>"`` to ``(project_id, project_name, cwd,
+  session_id?)``. ``on_session_start`` and the idempotent ``pre_llm_call``
+  hook apply the binding's cwd (primary), the legacy ``/pnew`` pending pin
+  (fallback), or NOTHING when the topic is unbound — the user then gets a
+  "bind this topic" warning in the topic instead of a silently
+  default-directory session. The deprecated dm_topics/thread_to_project
+  name-matching path survives only in the legacy tests.
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -141,6 +144,10 @@ _BACK_CB = "tgp:b"
 # adapter connects, so command handlers fall back to plain text.
 _NATIVE: Optional[Any] = None
 _ADAPTER: Optional[Any] = None
+# The gateway's event loop, captured when the Telegram factory wires in (the
+# factory itself runs on the loop). Sync hooks in worker threads use it to
+# schedule async sends (run_coroutine_threadsafe); None until wired.
+_WIRE_LOOP: Optional[asyncio.AbstractEventLoop] = None
 
 # --------------------------------------------------------------------- fallback text
 def _fallback_notice() -> str:
@@ -212,6 +219,165 @@ def _current_thread_id() -> str:
     return _session_env("HERMES_SESSION_THREAD_ID", "")
 
 
+# ------------------------------------------------------------- topic bindings
+# A topic is a working place: (project_id, project_name, cwd, session_id?).
+# The map lives in state.json["topic_bindings"] keyed "<chat_id>:<thread_id>".
+_BINDING_WARN_EVERY_S = 3600  # rate-limit for the "unbound topic" warning
+_BINDING_WARNED: Dict[str, float] = {}
+
+
+def _topic_binding_key() -> Optional[str]:
+    """``f"{chat_id}:{thread_id}"`` for the current session's topic, or None.
+
+    None means the session is not in a forum topic (plain DM without a
+    thread) — there is nothing to bind.
+    """
+    thread_id = _norm_thread_id(_current_thread_id())
+    if thread_id is None:
+        return None
+    chat_id = str(_session_env("HERMES_SESSION_CHAT_ID", "") or "").strip()
+    if not chat_id:
+        return None
+    return f"{chat_id}:{thread_id}"
+
+
+def _get_topic_binding() -> Optional[Dict[str, Any]]:
+    """The binding for the current topic (a copy), or None when unbound."""
+    key = _topic_binding_key()
+    if key is None:
+        return None
+    try:
+        bindings = _load_state().get("topic_bindings")
+        entry = bindings.get(key) if isinstance(bindings, dict) else None
+    except Exception:
+        logger.warning("tg-projects: topic_bindings unreadable", exc_info=True)
+        return None
+    return dict(entry) if isinstance(entry, dict) else None
+
+
+def _set_topic_binding(project_id: Any = None, project_name: Any = None,
+                       cwd: Any = None) -> bool:
+    """Create or refresh the binding for the current topic.
+
+    ``None`` arguments keep the stored value; the key's ``session_id`` is
+    NOT touched here (use :func:`_update_binding_session`). Returns False
+    when the current session is not in a topic.
+    """
+    key = _topic_binding_key()
+    if key is None:
+        return False
+    with _CWD_LOCK:
+        state = _load_state()
+        bindings = state.setdefault("topic_bindings", {})
+        entry = bindings.get(key)
+        if not isinstance(entry, dict):
+            entry = {}
+        if project_id is not None:
+            entry["project_id"] = str(project_id)
+        if project_name is not None:
+            entry["project_name"] = str(project_name)
+        if cwd is not None:
+            entry["cwd"] = str(cwd)
+        entry["updated_at"] = int(time.time())
+        bindings[key] = entry
+        _save_state(state)
+    return True
+
+
+def _update_binding_session(session_id: Optional[str]) -> None:
+    """Record the session now working in the current topic (None resets)."""
+    key = _topic_binding_key()
+    if key is None:
+        return
+    clean = str(session_id).strip() if session_id is not None else ""
+    with _CWD_LOCK:
+        state = _load_state()
+        bindings = state.get("topic_bindings") or {}
+        entry = bindings.get(key)
+        if not isinstance(entry, dict):
+            return  # nothing to update — bind the topic first
+        entry["session_id"] = clean or None
+        entry["updated_at"] = int(time.time())
+        bindings[key] = entry
+        _save_state(state)
+
+
+def _clear_topic_binding() -> None:
+    """Drop the current topic's binding (the topic becomes unbound)."""
+    key = _topic_binding_key()
+    if key is None:
+        return
+    with _CWD_LOCK:
+        state = _load_state()
+        bindings = state.get("topic_bindings") or {}
+        if key in bindings:
+            bindings.pop(key, None)
+            if not bindings:
+                state.pop("topic_bindings", None)
+            _save_state(state)
+
+
+def _thread_to_project_cwd() -> Optional[str]:
+    """LEGACY fallback: ``thread_to_project[thread_id]["cwd"]`` from state.json.
+
+    Read only when the current topic has NO topic_binding: the pre-binding
+    map recorded by /pproject keeps working for already-mapped topics. No
+    config.yaml dm_topics reads and no projects.db lookups — the entry
+    carries the cwd directly.
+    """
+    wanted = _norm_thread_id(_current_thread_id())
+    if wanted is None:
+        return None
+    try:
+        entry = (_load_state().get("thread_to_project") or {}).get(str(wanted))
+    except Exception:
+        return None
+    if not isinstance(entry, dict):
+        return None
+    cwd = str(entry.get("cwd") or "").strip()
+    return cwd if cwd and os.path.isdir(cwd) else None
+
+
+def _notify_unbound_topic(session_id: str) -> None:
+    """Warn the user (once per topic per hour) that the topic has no binding.
+
+    Best-effort: the hook runs in a worker thread, so the message is
+    scheduled onto the gateway's event loop captured at wire time. Without
+    a wired bot/loop the warning is logged only.
+    """
+    key = _topic_binding_key() or "no-topic"
+    now = time.time()
+    if now - _BINDING_WARNED.get(key, 0.0) < _BINDING_WARN_EVERY_S:
+        return
+    _BINDING_WARNED[key] = now
+    chat_id = str(_session_env("HERMES_SESSION_CHAT_ID", "") or "").strip()
+    thread_id = _norm_thread_id(_current_thread_id())
+    text = ("⚠️ Этот топик не привязан к проекту. Отправь /menu чтобы выбрать.")
+    logger.info("tg-projects: session %s started in unbound topic %s (cwd left NULL)",
+                session_id, key)
+    loop = _WIRE_LOOP
+    native = _NATIVE
+    if loop is None or native is None or getattr(native, "bot", None) is None \
+            or not chat_id or thread_id is None:
+        return
+    kwargs: Dict[str, Any] = {"chat_id": chat_id, "text": text}
+    if thread_id:
+        kwargs["message_thread_id"] = thread_id
+
+    async def _send() -> None:
+        try:
+            await native.bot.send_message(**kwargs)
+        except Exception:
+            logger.warning("tg-projects: unbound-topic warning send failed",
+                           exc_info=True)
+
+    try:
+        asyncio.run_coroutine_threadsafe(_send(), loop)
+    except Exception:
+        logger.warning("tg-projects: unbound-topic warning scheduling failed",
+                       exc_info=True)
+
+
 # ------------------------------------------------------------------ config -> topic -> project
 # In-process caches: the config mtime gate makes externally created topics visible
 # without a restart, and _CWD_APPLIED keeps the binders idempotent (one write per
@@ -235,8 +401,10 @@ def _norm_thread_id(value: Any) -> Optional[int]:
 
 
 def _config_dm_topics() -> List[Dict[str, Any]]:
-    """``platforms.telegram.extra.dm_topics[*].topics[*]`` from config.yaml, read-only.
+    """DEPRECATED: ``platforms.telegram.extra.dm_topics`` topic list (read-only).
 
+    Not a cwd source anymore (step 3: topic_bindings is); kept for the legacy
+    name-resolution tests only.
     The gateway persists newly created topics back into this file, so the cache is
     keyed by mtime instead of being forever frozen at plugin load.
     """
@@ -297,8 +465,9 @@ def _state_project_name_for_thread(thread_id: Any) -> str:
 
 
 def _topic_name_by_thread(thread_id: Any) -> str:
-    """The topic name owning *thread_id*, or '' when unmapped.
+    """DEPRECATED: topic-name resolution via thread_to_project + config dm_topics.
 
+    Superseded by topic_bindings; kept for the legacy tests.
     Resolution order: this plugin's state.json (topics created by /pproject,
     which the gateway config does not know about) then config.yaml's
     ``platforms.telegram.extra.dm_topics`` (read-only, mtime-cached).
@@ -333,11 +502,13 @@ def _project_by_name(projects: list, name: str):
 
 
 def _thread_cwd() -> Optional[str]:
-    """The current session's topic -> project -> primary_path cwd, or None.
+    """DEPRECATED: the pre-binding topic -> project -> primary_path resolution
+    (state thread_to_project + config dm_topics + projects.db name matching).
 
-    Topic names are the topic names from config.yaml; project names match them
-    case-insensitively with the slug as the fallback. Read-only everywhere: this
-    never writes to config.yaml or projects.db.
+    Superseded by ``state.json["topic_bindings"]`` (step 3): on_session_start
+    and pre_llm_call take the cwd from the binding, never from here. Kept
+    only because the legacy tests exercise it; the production fallback is
+    :func:`_thread_to_project_cwd` (state.json only, no config reads).
     """
     name = _topic_name_by_thread(_current_thread_id())
     if not name:
@@ -447,6 +618,8 @@ def _apply_session_cwd(session_id: str, cwd: str, reason: str) -> None:
 
 # --------------------------------------------------------------------- state file
 def _save_thread_project(thread_id: Any, project) -> None:
+    """DEPRECATED: write into thread_to_project. Superseded by
+    ``_set_topic_binding``; kept for the legacy tests."""
     """Record that *thread_id* belongs to *project* (state.json, not config.yaml)."""
     wanted = _norm_thread_id(thread_id)
     if wanted is None:
@@ -997,10 +1170,14 @@ def _on_session_start(**kwargs) -> None:
     """Apply the current session's working directory to a freshly created session.
 
     The core fires this once per new session id (agent/conversation_loop.py,
-    first-turn path, ``session_id=agent.session_id``). A pending project pin
-    (/pnew, "new session" button) takes priority; otherwise the session's
-    Telegram topic is matched to a project via config.yaml
-    (``platforms.telegram.extra.dm_topics``) and the project's cwd is applied.
+    first-turn path, ``session_id=agent.session_id``). Source priority is
+    STRICTLY:
+      1) ``state.json["topic_bindings"]["<chat_id>:<thread_id>"]["cwd"]`` —
+         the topic is a working place, the binding is the single source;
+      2) ``pending_cwd[session_key]`` — legacy /pnew pin fallback;
+      3) no source → NO cwd is applied (``sessions.cwd`` stays NULL, the
+         terminal tool keeps its own default), and the user gets a
+         "bind this topic" warning in the topic itself.
 
     Failures are swallowed: a cwd pin must never break session start.
     """
@@ -1010,23 +1187,50 @@ def _on_session_start(**kwargs) -> None:
             return
 
         cwd, reason = None, ""
+
+        # 1) topic binding — the primary source
+        binding = _get_topic_binding()
+        if binding is not None:
+            candidate = str(binding.get("cwd") or "").strip()
+            if candidate and os.path.isdir(candidate):
+                cwd, reason = candidate, "topic binding"
+            elif candidate:
+                logger.warning(
+                    "tg-projects: bound cwd %r missing on host (session %s)",
+                    candidate, session_id)
+
+        # 2) legacy pending pin — fallback when the topic has no usable
+        #    binding. Consumed EITHER WAY (like the pre-binding code): a
+        #    stale pin must never fire later on an unrelated session.
         sk = _current_session_key()
         state = _load_state()
         pending = state.get("pending_cwd") or {}
         entry = pending.pop(sk, None) if sk else None
         if entry is not None:
-            candidate = str(entry.get("cwd") or "").strip()
-            if candidate and os.path.isdir(candidate):
-                cwd, reason = candidate, "pending pin"
-            else:
-                logger.warning("tg-projects: dropping stale pin cwd=%r", candidate)
             _save_state(state)  # consume the pin either way (no retry loop)
+            if cwd is None:
+                candidate = str(entry.get("cwd") or "").strip()
+                if candidate and os.path.isdir(candidate):
+                    cwd, reason = candidate, "pending pin"
+                else:
+                    logger.warning("tg-projects: dropping stale pin cwd=%r", candidate)
 
-        if cwd is None:
-            cwd, reason = _thread_cwd(), "topic->project"
+        # 3) thread_to_project — the pre-binding legacy map, read ONLY for
+        #    topics that never got a topic_binding (config dm_topics is not
+        #    consulted: that is the core adapter's layer).
+        if cwd is None and binding is None:
+            cwd, reason = _thread_to_project_cwd(), "thread_to_project legacy"
 
         if cwd:
             _apply_session_cwd(session_id, cwd, reason)
+            if binding is not None:
+                _update_binding_session(session_id)
+        else:
+            # 3) unbound topic: no silent default-cwd session. The core has
+            #    already created the session row (this hook has no veto in
+            #    the invoke_hook contract — results are ignored), so the
+            #    achievable behavior is: cwd stays NULL + the user is told.
+            _notify_unbound_topic(session_id)
     except Exception:
         logger.warning("tg-projects: on_session_start failed", exc_info=True)
 
@@ -1037,28 +1241,37 @@ def _on_pre_llm_call(**kwargs) -> None:
     The core fires on_session_start ONLY on the first turn of a session whose
     durable row is NEW (agent/conversation_loop.py ~865). A topic's very first
     session (no /new pin) and a session reopened via /resume skip that path,
-    so this per-turn hook applies the topic->project cwd for such sessions.
+    so this per-turn hook re-applies the topic binding cwd for such sessions.
+    Source priority matches :func:`_on_session_start`: topic binding first,
+    legacy pending pin second; unbound topics get nothing applied.
 
     Idempotent: _apply_session_cwd records the last applied cwd per session id
-    and no-ops on repeats, so steady-state turns cost one dict lookup. The
-    pending pin, when present, still wins — applied on_session_start has
-    already stamped _CWD_APPLIED, and a direct pre_llm_call call applies the
-    same priority.
+    and no-ops on repeats, so steady-state turns cost one dict lookup.
     """
     try:
         session_id = str(kwargs.get("session_id") or kwargs.get("task_id") or "").strip()
         if not session_id:
             return
         cwd, reason = None, ""
-        sk = _current_session_key()
-        if sk:
-            pending = (_load_state().get("pending_cwd") or {}).get(sk)
-            if pending:
-                candidate = str(pending.get("cwd") or "").strip()
-                if candidate and os.path.isdir(candidate):
-                    cwd, reason = candidate, "pending pin"
+
+        binding = _get_topic_binding()
+        if binding is not None:
+            candidate = str(binding.get("cwd") or "").strip()
+            if candidate and os.path.isdir(candidate):
+                cwd, reason = candidate, "topic binding"
+
         if cwd is None:
-            cwd, reason = _thread_cwd(), "topic->project"
+            sk = _current_session_key()
+            if sk:
+                pending = (_load_state().get("pending_cwd") or {}).get(sk)
+                if pending:
+                    candidate = str(pending.get("cwd") or "").strip()
+                    if candidate and os.path.isdir(candidate):
+                        cwd, reason = candidate, "pending pin"
+
+        # legacy thread_to_project fallback for never-bound topics
+        if cwd is None and binding is None:
+            cwd, reason = _thread_to_project_cwd(), "thread_to_project legacy"
         if cwd:
             _apply_session_cwd(session_id, cwd, reason)
     except Exception:
@@ -1740,10 +1953,15 @@ async def _send_gateway_command(query, text: str) -> None:
 def _telegram_wire(native: Any, adapter: Any) -> None:
     """register_platform_handler factory: scope the plugin's callback handler
     (pattern ``^tgp:``) onto the Telegram application without touching the
-    core button flows."""
-    global _NATIVE, _ADAPTER
+    core button flows. Also captures the running event loop so sync hooks
+    (on_session_start runs in a worker thread) can schedule async sends."""
+    global _NATIVE, _ADAPTER, _WIRE_LOOP
     _NATIVE = native
     _ADAPTER = adapter
+    try:
+        _WIRE_LOOP = asyncio.get_running_loop()
+    except RuntimeError:
+        _WIRE_LOOP = None  # factory ran off-loop; sync sends degrade to log
     try:
         from telegram.ext import CallbackQueryHandler
         native.add_handler(CallbackQueryHandler(_tg_on_button, pattern=r"^tgp:"))
@@ -1774,14 +1992,30 @@ def _import_handoff():
 
 
 async def _handle_handoff_callback(query, data: str) -> bool:
-    """Route ``tgp:ho:<session_id>:(y|n)`` taps. True when consumed."""
+    """Route ``tgp:ho:<token>:(y|n)`` taps. True when consumed.
+
+    The callback_data carries an opaque 8-hex token (not the session_id —
+    that would blow the 64-byte Telegram cap for real session ids). The
+    real ``session_id`` / ``session_key`` are looked up from
+    ``handoff_tokens`` in state.json via ``handoff.consume_token``, which
+    also deletes the row so a second tap lands on the "expired" reply.
+    """
     import re as _re
-    m = _re.match(r"^tgp:ho:([A-Za-z0-9_\-]{8,58}):(y|n)$", str(data or ""))
+    m = _re.match(r"^tgp:ho:([a-f0-9]{8}):(y|n)$", str(data or ""))
     if m is None:
         return False
-    session_id, answer = m.group(1), m.group(2)
+    token, answer = m.group(1), m.group(2)
     handoff = _import_handoff()
-    sk = _current_session_key() or _session_key_from_query(query)
+    resolved = handoff.consume_token(token)
+    if resolved is None:
+        with _suppress(Exception):
+            await query.edit_message_text(
+                "⚠️ Запрос устарел (истёк или уже использован). "
+                "Отправьте сообщение заново.")
+        return True
+    session_id, sk = resolved
+    if not sk:
+        sk = _current_session_key() or _session_key_from_query(query)
     if answer == "n":
         handoff.drop_pending(sk)
         with _suppress(Exception):
@@ -1794,7 +2028,8 @@ async def _handle_handoff_callback(query, data: str) -> bool:
     if pending is None:
         with _suppress(Exception):
             await query.edit_message_text(
-                "⚠️ Запрос устарел (истёк или сессия сменилась). Отправьте сообщение заново.")
+                "⚠️ Запрос устарел (истёк или сессия сменилась). "
+                "Отправьте сообщение заново.")
         return True
 
     with _suppress(Exception):

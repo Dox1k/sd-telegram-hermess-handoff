@@ -905,5 +905,134 @@ class CwdPersistTests(unittest.TestCase):
         self.assertEqual(mod._CWD_APPLIED, {})
 
 
+class TopicBindingTests(unittest.TestCase):
+    """topic_bindings: the step-3 topic -> workplace map and the new
+    on_session_start source priority (binding > pending pin > nothing)."""
+
+    def setUp(self):
+        _reset_fake_db()
+        _STATE.data = {"pending_cwd": {}, "thread_to_project": {}}
+        mod._BINDING_WARNED.clear()
+        # a throwaway HERMES_HOME with a state.db file, so cwd persists
+        # never touch the real ~/.hermes/state.db
+        self._tmpdir = tempfile.TemporaryDirectory()
+        Path(self._tmpdir.name, "state.db").write_bytes(b"")
+        self.addCleanup(self._cleanup)
+
+    def _cleanup(self):
+        _reset_fake_db()
+        _STATE.data = {"pending_cwd": {}, "thread_to_project": {}}
+        mod._BINDING_WARNED.clear()
+        self._tmpdir.cleanup()
+
+    def _insert_session(self, sid: str):
+        _FAKE_STATE.conn.execute(
+            "INSERT INTO sessions (id, source, cwd) VALUES (?,?,?)",
+            (sid, "telegram", None))
+        _FAKE_STATE.conn.commit()
+
+    def test_binding_key_requires_chat_and_thread(self):
+        with _with_env(HERMES_SESSION_CHAT_ID="5", HERMES_SESSION_THREAD_ID="88888"):
+            self.assertEqual(mod._topic_binding_key(), "5:88888")
+        with _with_env(HERMES_SESSION_CHAT_ID="5", HERMES_SESSION_THREAD_ID=""):
+            self.assertIsNone(mod._topic_binding_key())
+        with _with_env(HERMES_SESSION_CHAT_ID="", HERMES_SESSION_THREAD_ID="88888"):
+            self.assertIsNone(mod._topic_binding_key())
+
+    def test_binding_key_normalizes_fractional_thread(self):
+        with _with_env(HERMES_SESSION_CHAT_ID="5", HERMES_SESSION_THREAD_ID="65008.5"):
+            self.assertEqual(mod._topic_binding_key(), "5:65008")
+
+    def test_set_get_clear_roundtrip(self):
+        with _with_env(HERMES_SESSION_CHAT_ID="5", HERMES_SESSION_THREAD_ID="88888"):
+            self.assertTrue(mod._set_topic_binding("p1", "Ambrozia", str(PLUGIN_DIR)))
+            binding = mod._get_topic_binding()
+            self.assertEqual(binding["project_id"], "p1")
+            self.assertEqual(binding["project_name"], "Ambrozia")
+            self.assertEqual(binding["cwd"], str(PLUGIN_DIR))
+            self.assertIn("updated_at", binding)
+            mod._update_binding_session("sess-9")
+            self.assertEqual(mod._get_topic_binding()["session_id"], "sess-9")
+            mod._update_binding_session(None)
+            self.assertIsNone(mod._get_topic_binding()["session_id"])
+            mod._clear_topic_binding()
+            self.assertIsNone(mod._get_topic_binding())
+        # state bucket removed entirely when empty
+        self.assertNotIn("topic_bindings", _STATE.data)
+
+    def test_set_binding_without_topic_fails(self):
+        with _with_env(HERMES_SESSION_CHAT_ID="5", HERMES_SESSION_THREAD_ID=""):
+            self.assertFalse(mod._set_topic_binding("p1", "x", "/p"))
+            self.assertIsNone(mod._get_topic_binding())
+
+    def test_update_binding_session_needs_existing_binding(self):
+        with _with_env(HERMES_SESSION_CHAT_ID="5", HERMES_SESSION_THREAD_ID="88888"):
+            mod._update_binding_session("sess-1")  # no binding yet: no-op
+            self.assertIsNone(mod._get_topic_binding())
+
+    def test_on_session_start_applies_binding_cwd(self):
+        self._insert_session("sess-1")
+        with _with_env(HERMES_SESSION_CHAT_ID="5", HERMES_SESSION_THREAD_ID="88888",
+                       HERMES_HOME=self._tmpdir.name):
+            mod._set_topic_binding("p1", "Ambrozia", str(PLUGIN_DIR))
+            mod._on_session_start(session_id="sess-1")
+            self.assertEqual(fake_terminal._cwd.get("sess-1"), {"cwd": str(PLUGIN_DIR)})
+            self.assertEqual(mod._CWD_APPLIED.get("sess-1"), str(PLUGIN_DIR))
+            # binding now records the working session
+            self.assertEqual(mod._get_topic_binding()["session_id"], "sess-1")
+
+    def test_on_session_start_binding_wins_over_pending_pin(self):
+        self._insert_session("sess-1")
+        _STATE.data["pending_cwd"] = {
+            "sk-1": {"project_id": "p2", "name": "default", "slug": "default",
+                     "cwd": "/nonexistent-pin", "ts": 0}}
+        with _with_env(HERMES_SESSION_CHAT_ID="5", HERMES_SESSION_THREAD_ID="88888",
+                       HERMES_SESSION_KEY="sk-1", HERMES_HOME=str(PLUGIN_DIR)):
+            mod._set_topic_binding("p1", "Ambrozia", str(PLUGIN_DIR))
+            mod._on_session_start(session_id="sess-1")
+            # binding cwd applied, pin consumed but not used
+            self.assertEqual(fake_terminal._cwd.get("sess-1"), {"cwd": str(PLUGIN_DIR)})
+            self.assertNotIn("sk-1", _STATE.data.get("pending_cwd", {}))
+
+    def test_on_session_start_pending_pin_legacy_fallback(self):
+        self._insert_session("sess-1")
+        _STATE.data["pending_cwd"] = {
+            "sk-1": {"project_id": "p1", "name": "Ambrozia", "slug": "ambrozia",
+                     "cwd": str(PLUGIN_DIR), "ts": 0}}
+        # thread WITHOUT a binding: the pin is the fallback
+        with _with_env(HERMES_SESSION_CHAT_ID="5", HERMES_SESSION_THREAD_ID="77777",
+                       HERMES_SESSION_KEY="sk-1", HERMES_HOME=self._tmpdir.name):
+            mod._on_session_start(session_id="sess-1")
+            self.assertEqual(fake_terminal._cwd.get("sess-1"), {"cwd": str(PLUGIN_DIR)})
+
+    def test_on_session_start_unbound_topic_applies_nothing(self):
+        _reset_fake_db()
+        with _with_env(HERMES_SESSION_CHAT_ID="5", HERMES_SESSION_THREAD_ID="77777",
+                       HERMES_HOME=self._tmpdir.name):
+            mod._on_session_start(session_id="sess-unbound")
+            # no cwd registered anywhere, no state.db write, no applied stamp
+            self.assertEqual(fake_terminal._calls, [])
+            self.assertEqual(_FakeSessionDB.instances, [])
+            self.assertNotIn("sess-unbound", mod._CWD_APPLIED)
+        # the unbound-topic warning was rate-limited-stamped for this topic
+        self.assertIn("5:77777", mod._BINDING_WARNED)
+
+    def test_unbound_warning_sent_once_per_hour(self):
+        with _with_env(HERMES_SESSION_CHAT_ID="5", HERMES_SESSION_THREAD_ID="77777",
+                       HERMES_HOME=self._tmpdir.name):
+            mod._notify_unbound_topic("s-a")
+            first = dict(mod._BINDING_WARNED)
+            mod._notify_unbound_topic("s-b")  # same topic: rate-limited
+            self.assertEqual(mod._BINDING_WARNED, first)
+
+    def test_pre_llm_call_applies_binding_cwd(self):
+        self._insert_session("sess-1")
+        with _with_env(HERMES_SESSION_CHAT_ID="5", HERMES_SESSION_THREAD_ID="88888",
+                       HERMES_HOME=self._tmpdir.name):
+            mod._set_topic_binding("p1", "Ambrozia", str(PLUGIN_DIR))
+            mod._on_pre_llm_call(session_id="sess-1")
+            self.assertEqual(fake_terminal._cwd.get("sess-1"), {"cwd": str(PLUGIN_DIR)})
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

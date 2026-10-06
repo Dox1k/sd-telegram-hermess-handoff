@@ -165,13 +165,17 @@ class _StateStub:
     """Replace state.json reads/writes with an in-memory dict."""
 
     def __init__(self):
-        self.data = {"pending_cwd": {}}
+        self.data = {"pending_cwd": {}, "thread_to_project": {}}
 
     def install(self):
         self._orig_load, self._orig_save = mod._load_state, mod._save_state
 
         def _load():
-            return {"pending_cwd": dict(self.data.get("pending_cwd") or {})}
+            return {
+                "pending_cwd": dict(self.data.get("pending_cwd") or {}),
+                "thread_to_project": dict(self.data.get("thread_to_project") or {}),
+                "topic_bindings": dict(self.data.get("topic_bindings") or {}),
+            }
 
         def _save(state):
             self.data = state
@@ -182,12 +186,23 @@ class _StateStub:
         self.data.setdefault("pending_cwd", {})[sk] = {
             "project_id": 99, "name": "X", "slug": "x", "cwd": cwd, "ts": 0}
 
+    def legacy_map(self, thread_id, cwd):
+        """A pre-binding thread_to_project entry (the step-3 legacy fallback)."""
+        self.data.setdefault("thread_to_project", {})[str(thread_id)] = {
+            "project_id": 1, "name": "L", "slug": "l", "cwd": cwd, "ts": 0}
+
 
 class TopicCwdTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.state = _StateStub()
         cls.state.install()
+
+    def setUp(self):
+        # the class-level stub is shared: reset the per-topic maps so a
+        # legacy_map/ pin left by an earlier test cannot leak into the next
+        self.state.data["thread_to_project"] = {}
+        self.state.data["topic_bindings"] = {}
 
     # ------------------------------------------------- thread -> project matching
     def test_thread_maps_to_project_cwd(self):
@@ -210,7 +225,10 @@ class TopicCwdTests(unittest.TestCase):
             self.assertEqual(mod._thread_cwd(), None)
 
     def test_pre_llm_call_binds_topic_project(self):
+        # step 3: the hook reads topic_bindings / thread_to_project legacy —
+        # NOT config dm_topics. A legacy-mapped thread still gets its cwd.
         with _with_env(HERMES_SESSION_THREAD_ID="65008"):
+            self.state.legacy_map("65008", str(PLUGIN_DIR))
             mod._on_pre_llm_call(session_id="sess-1", task_id="sess-1")
             self.assertEqual(fake_terminal._cwd.get("sess-1"), {"cwd": str(PLUGIN_DIR)})
             self.assertEqual(fake_terminal._session_cwd.get("sess-1"), str(PLUGIN_DIR))
@@ -218,6 +236,12 @@ class TopicCwdTests(unittest.TestCase):
             before = len(fake_terminal._calls)
             mod._on_pre_llm_call(session_id="sess-1", task_id="sess-1")
             self.assertEqual(len(fake_terminal._calls), before)
+
+    def test_pre_llm_call_ignores_unbound_topic(self):
+        # a thread with neither binding nor legacy map applies NOTHING
+        with _with_env(HERMES_SESSION_THREAD_ID="65008"):
+            mod._on_pre_llm_call(session_id="sess-8", task_id="sess-8")
+            self.assertNotIn("sess-8", fake_terminal._cwd)
 
     # ------------------------------------------------------- pending-pin priority
     def test_pending_pin_wins_over_topic(self):
@@ -233,12 +257,14 @@ class TopicCwdTests(unittest.TestCase):
 
     def test_on_session_start_prefers_pending_then_consumes(self):
         with _with_env(HERMES_SESSION_THREAD_ID="65006", HERMES_SESSION_KEY="k1"):
+            # legacy map present, but the pending pin wins
+            self.state.legacy_map("65006", str(PLUGIN_DIR))
             self.state.pin("k1", str(PLUGIN_DIR) + "/pin-cwd")
             Path(str(PLUGIN_DIR) + "/pin-cwd").mkdir(exist_ok=True)
             try:
                 mod._on_session_start(session_id="sess-3", model="m")
                 self.assertEqual(fake_terminal._cwd.get("sess-3"), {"cwd": str(PLUGIN_DIR) + "/pin-cwd"})
-                # pin consumed -> next call falls back to the topic
+                # pin consumed -> next call falls back to the legacy map
                 mod._on_session_start(session_id="sess-4", model="m")
                 self.assertEqual(fake_terminal._cwd.get("sess-4"), {"cwd": str(PLUGIN_DIR)})
                 self.assertNotIn("k1", self.state.data.get("pending_cwd") or {})
@@ -255,9 +281,10 @@ class TopicCwdTests(unittest.TestCase):
 
     def test_stale_pending_pin_is_dropped(self):
         with _with_env(HERMES_SESSION_THREAD_ID="64999", HERMES_SESSION_KEY="k1"):
+            self.state.legacy_map("64999", str(PLUGIN_DIR))
             self.state.pin("k1", "/definitely/does/not/exist-xyz")
             mod._on_session_start(session_id="sess-7", model="m")
-            # stale pin dropped, topic fallback still applies
+            # stale pin dropped, legacy map fallback still applies
             self.assertEqual(fake_terminal._cwd.get("sess-7"), {"cwd": str(PLUGIN_DIR)})
 
     def test_empty_topic_name_ignored(self):

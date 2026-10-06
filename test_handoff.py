@@ -242,11 +242,90 @@ class PerformHandoffTests(unittest.TestCase):
 
 class CallbackRecognitionTests(unittest.TestCase):
     def test_is_handoff_callback(self):
-        self.assertTrue(handoff.is_handoff_callback("tgp:ho:20261003_225921_f8d1e0:y"))
-        self.assertTrue(handoff.is_handoff_callback("tgp:ho:20261003_225921_f8d1e0:n"))
+        # New token-based format: 8-hex token, y or n answer.
+        self.assertTrue(handoff.is_handoff_callback("tgp:ho:deadbeef:y"))
+        self.assertTrue(handoff.is_handoff_callback("tgp:ho:deadbeef:n"))
         self.assertFalse(handoff.is_handoff_callback("tgp:s:20261003_225921_f8d1e0"))
         self.assertFalse(handoff.is_handoff_callback("tgp:p:1"))
-        self.assertFalse(handoff.is_handoff_callback("tgp:ho:short:y"))
+        self.assertFalse(handoff.is_handoff_callback("tgp:ho:short:y"))  # 5 chars
+        self.assertFalse(handoff.is_handoff_callback("tgp:ho:deadbeefx:y"))  # 9 chars
+        self.assertFalse(handoff.is_handoff_callback("tgp:ho:DEADBEEF:y"))  # uppercase
+        # Old session_id format no longer matches (24-char ids would exceed
+        # Telegram's 64-byte callback_data cap once combined with the prefix).
+        self.assertFalse(handoff.is_handoff_callback("tgp:ho:20261003_225921_f8d1e0:y"))
+
+    def test_token_caps_well_within_64_bytes(self):
+        # Real session ids are 24 chars; token caps them at 8 hex.
+        # tgp:ho: (7) + 8 + :y (2) = 17 bytes total. Well under 64.
+        for token_len in (7, 8, 9):
+            data = f"tgp:ho:{'a' * token_len}:y"
+            self.assertEqual(len(data.encode("utf-8")), 7 + token_len + 2)
+        self.assertLessEqual(17, 64)
+
+
+class TokenManagementTests(unittest.TestCase):
+    def setUp(self):
+        self._t = _TempHome()
+
+    def tearDown(self):
+        self._t.restore()
+
+    def test_register_and_consume_roundtrip(self):
+        token = handoff.register_token("20261006_153514_bc11eb79", "sk-lane")
+        self.assertEqual(len(token), 8)
+        self.assertTrue(handoff.is_handoff_callback(f"tgp:ho:{token}:y"))
+        sid, sk = handoff.consume_token(token)
+        self.assertEqual(sid, "20261006_153514_bc11eb79")
+        self.assertEqual(sk, "sk-lane")
+
+    def test_consume_is_destructive(self):
+        token = handoff.register_token("s1", "sk1")
+        self.assertIsNotNone(handoff.consume_token(token))
+        self.assertIsNone(handoff.consume_token(token))
+
+    def test_consume_unknown_returns_none(self):
+        self.assertIsNone(handoff.consume_token("deadbeef"))
+
+    def test_empty_session_id_cannot_register(self):
+        self.assertEqual(handoff.register_token("", "sk1"), "")
+        self.assertEqual(handoff.register_token("   ", "sk1"), "")
+        self.assertEqual(handoff.register_token(None, "sk1"), "")
+
+    def test_expired_token_returns_none(self):
+        token = handoff.register_token("s1", "sk1")
+        state = self._t.state()
+        state["handoff_tokens"][token]["ts"] = int(time.time()) - 999999
+        handoff._STATE_FILE.write_text(json.dumps(state), encoding="utf-8")
+        self.assertIsNone(handoff.consume_token(token))
+        # entry removed (consume is destructive even on stale)
+        self.assertNotIn(token, self._t.state().get("handoff_tokens", {}))
+
+    def test_register_prunes_stale_tokens(self):
+        # Seed a stale entry plus a live one, then register a new token:
+        # only the live one and the new one survive.
+        stale = "00000000"
+        live = "11111111"
+        state = {
+            "handoff_tokens": {
+                stale: {"session_id": "old", "session_key": "sk-old",
+                        "ts": int(time.time()) - 999999},
+                live: {"session_id": "keep", "session_key": "sk-keep",
+                       "ts": int(time.time())},
+            }
+        }
+        handoff._STATE_FILE.write_text(json.dumps(state), encoding="utf-8")
+        token = handoff.register_token("s-new", "sk-new")
+        after = self._t.state()["handoff_tokens"]
+        self.assertNotIn(stale, after)          # pruned
+        self.assertIn(live, after)              # kept
+        self.assertIn(token, after)             # newly registered
+        self.assertEqual(len(after), 2)
+
+    def test_consume_of_exhausted_bucket_cleans_up(self):
+        token = handoff.register_token("s1", "sk1")
+        handoff.consume_token(token)
+        # when the bucket is empty, the key itself is dropped from state.json
+        self.assertNotIn("handoff_tokens", self._t.state())
 
 
 class HookFailOpenTests(unittest.TestCase):
