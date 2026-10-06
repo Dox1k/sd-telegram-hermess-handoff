@@ -701,6 +701,53 @@ def _start_pc_reply_mirror(native: Any) -> None:
         pass  # factory ran off-loop; mirror stays off
 
 
+# The chat-whitelisted owner: the only chat the command menu is scoped to.
+_OWNER_CHAT_ID = "7559860199"
+
+
+def _push_owner_command_menu(native: Any) -> None:
+    """Set the owner-chat-scoped Telegram command menu (idempotent, best-effort).
+
+    Core's _register_command_menu pushes 60 commands into the Default /
+    AllPrivateChats / AllGroupChats scopes; its 60-command cap drops this
+    plugin's commands (/menu, /projects, ...). A BotCommandScopeChat list
+    REPLACES the effective menu in that one chat, so the owner always sees
+    the ten commands that matter — the "/" menu button then needs no typing.
+    """
+    bot = getattr(native, "bot", None)
+    if bot is None:
+        return
+    menu: List[tuple] = [
+        ("menu", "Панель топика — кнопки проекта, сессии и управления"),
+        ("projects", "Проекты и последние сессии каждого"),
+        ("pnew", "Проект для следующей сессии (после /new)"),
+        ("pproject", "Создать проект: имя + путь"),
+        ("help", "Показать доступные команды"),
+        ("status", "Статус сессии: модель, токены и контекст"),
+        ("model", "Выбрать модель для текущей сессии"),
+        ("profile", "Активный профиль и домашний каталог"),
+        ("new", "Начать новую сессию с чистой историей"),
+        ("stop", "Остановить все фоновые процессы"),
+    ]
+
+    async def _set() -> None:
+        try:
+            from telegram import BotCommand, BotCommandScopeChat
+            await bot.set_my_commands(
+                [BotCommand(cmd, desc) for cmd, desc in menu],
+                scope=BotCommandScopeChat(chat_id=int(_OWNER_CHAT_ID)))
+            logger.info("tg-projects: owner command menu set (%d commands)",
+                        len(menu))
+        except Exception:
+            logger.warning("tg-projects: owner command menu push failed",
+                           exc_info=True)
+
+    try:
+        asyncio.get_running_loop().create_task(_set())
+    except RuntimeError:
+        pass
+
+
 # ------------------------------------------------------------------ config -> topic -> project
 # In-process caches: the config mtime gate makes externally created topics visible
 # without a restart, and _CWD_APPLIED keeps the binders idempotent (one write per
@@ -2329,6 +2376,7 @@ def _telegram_wire(native: Any, adapter: Any) -> None:
         native.add_handler(CallbackQueryHandler(_tg_on_button, pattern=r"^tgp:"))
         logger.info("tg-projects: telegram callback handler wired (pattern ^tgp:)")
         _start_pc_reply_mirror(native)
+        _push_owner_command_menu(native)
     except Exception:
         logger.warning("tg-projects: telegram wiring failed", exc_info=True)
         _NATIVE = None
