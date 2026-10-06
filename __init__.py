@@ -2953,6 +2953,40 @@ async def _pb_sessions_screen(query, chat_id: str, thread_id: Optional[int]) -> 
                                       reply_markup=InlineKeyboardMarkup(rows))
 
 
+def _session_info_text(session_id: str) -> str:
+    """The session summary shown when the user ENTERS a session: identity,
+    volume (messages/tokens), model, cwd and the last user lines."""
+    state_conn = _sessions_state_conn()
+    try:
+        row = state_conn.execute(
+            "SELECT id, title, model, cwd, started_at, message_count,"
+            " input_tokens, output_tokens FROM sessions WHERE id = ?",
+            (session_id,),
+        ).fetchone()
+        if row is None:
+            return ""
+        tail = _last_user_lines(state_conn, session_id, limit=2)
+    except Exception:
+        return ""
+    finally:
+        with _suppress(Exception):
+            state_conn.close()
+    title = str(row["title"] or "").strip() or "(без названия)"
+    in_tok, out_tok = int(row["input_tokens"] or 0), int(row["output_tokens"] or 0)
+    lines = [
+        f"🧵 Сессия: {title}",
+        f"🆔 {row['id']}",
+        f"💬 {row['message_count']} msg · 🔤 {in_tok + out_tok} токенов (in {in_tok} / out {out_tok})",
+        f"🤖 {row['model'] or 'модель не указана'}",
+        f"📂 {row['cwd'] or 'каталог не указан'}",
+        f"🕐 старт {_fmt_ts(row['started_at'])}",
+    ]
+    if tail:
+        lines.append("На чём остановились:")
+        lines.extend(f"  • {t}" for t in tail)
+    return "\n".join(lines)
+
+
 async def _pb_pick_session(query, chat_id: str, thread_id: Optional[int],
                            session_id: str) -> None:
     """A tgp:pb:sesss:<id> tap: bind the session, resume it, re-render the panel."""
@@ -2973,6 +3007,17 @@ async def _pb_pick_session(query, chat_id: str, thread_id: Optional[int],
         return
     _pb_write_binding_session(chat_id, thread_id, session_id)
     await _do_resume_by_id(query, session_id)
+    # The enter-summary rides its own message: _pb_render re-renders the panel
+    # in place right after, so a summary edited into the panel would vanish.
+    info = _session_info_text(session_id)
+    bot = getattr(_NATIVE, "bot", None) if _NATIVE is not None else None
+    if info and bot is not None:
+        kwargs: Dict[str, Any] = {"chat_id": chat_id, "text": info}
+        tid = _norm_thread_id(thread_id)
+        if tid:
+            kwargs["message_thread_id"] = tid
+        with _suppress(Exception):
+            await bot.send_message(**kwargs)
     await _pb_render(query, chat_id, thread_id)
 
 
