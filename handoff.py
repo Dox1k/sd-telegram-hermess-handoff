@@ -223,9 +223,13 @@ def steal_lease(session_id: str) -> bool:
     """Delete the foreign turn lease so the other device's turn dies on its
     next transcript write (SessionTurnLeaseLostError).
 
-    Only rows whose holder is NOT platform=telegram are deleted — our own
-    gateway turns keep their leases. Write access is a one-shot connection
-    under WAL; a busy db retries via timeout once. Never raises.
+    Fail-closed on an unknown holder: a lease whose holder carries NO
+    explicit ``platform=`` token belongs to a surface this code cannot name
+    (core holders embed the routing key, not always a platform tag) — it is
+    never deleted. Only rows explicitly stamped with a non-telegram platform
+    are stolen; our own gateway turns keep their leases. Write access is a
+    one-shot connection under WAL; a busy db retries via timeout once. Never
+    raises.
     """
     sid = str(session_id or "").strip()
     path = _state_db_path()
@@ -243,6 +247,8 @@ def steal_lease(session_id: str) -> bool:
         platform = parse_holder_platform(row["holder"])
         if platform == "telegram":
             return False  # never steal our own surface's lease
+        if not platform:
+            return False  # unknown surface — fail closed, never delete
         conn.execute("DELETE FROM session_turn_leases WHERE conversation_id = ?", (sid,))
         conn.commit()
         logger.info("tg-projects handoff: stole lease for %s (was %s)", sid, platform)

@@ -228,12 +228,13 @@ _BINDING_WARNED: Dict[str, float] = {}
 def _topic_binding_key() -> Optional[str]:
     """``f"{chat_id}:{thread_id}"`` for the current session's topic, or None.
 
-    None means the session is not in a forum topic (plain DM without a
-    thread) — there is nothing to bind.
+    A topic-less DM (topics disabled) normalizes to thread 0 — the chat's
+    single flat lane, the same key the panel/sync paths use. None means the
+    session has no Telegram chat at all (desktop/CLI) — nothing to bind.
     """
     thread_id = _norm_thread_id(_current_thread_id())
     if thread_id is None:
-        return None
+        thread_id = 0
     chat_id = str(_session_env("HERMES_SESSION_CHAT_ID", "") or "").strip()
     if not chat_id:
         return None
@@ -2147,7 +2148,7 @@ async def _do_resume_by_id(query, session_id: str) -> None:
         # inside _session_is_same_source, whose fail-open returned True and
         # silently downgraded "/resume --all" to a plain "/resume" that the
         # gateway's IDOR guard then refused.
-        cross_origin = not _session_is_same_source(state_conn, session_id, row["source"], source)
+        cross_origin = not _session_is_same_source(state_conn, session_id, "", source)
         admin = _callers_admin(source)
     finally:
         with _suppress(Exception):
@@ -2422,9 +2423,12 @@ async def _do_resume(query, project, index_str: str, state_conn) -> None:
         pass
 
     # Cross-origin (desktop) targets need the admin --all form, exactly like
-    # _do_resume_by_id — a plain /resume hits the gateway's IDOR guard.
+    # _do_resume_by_id — a plain /resume hits the gateway's IDOR guard. The
+    # comparison uses the CALLER's source (empty session_source), never the
+    # target row's — passing row["source"] made _caller_source_value echo the
+    # session's own platform and cross_origin was always False.
     cross_origin = not _session_is_same_source(
-        state_conn, target["id"], target.get("source", ""), _adapter_source_for(query))
+        state_conn, target["id"], "", _adapter_source_for(query))
     admin = _callers_admin(_adapter_source_for(query))
     resume_cmd = (f"/resume --all {target['id']}" if cross_origin and admin
                   else f"/resume {target['id']}")
@@ -3666,6 +3670,13 @@ async def _wizard_on_button(query: Any, data: str) -> None:
     key = _wizard_key(chat_id, thread_id)
 
     if data == _WIZARD_START_CB:
+        if not user_id:
+            # No tapper identity → no way to bind the dialog's free text to
+            # the person who started it. Fail closed instead of accepting
+            # anyone's next message as an answer.
+            with _suppress(Exception):
+                await query.answer("⚠️ Не удалось определить пользователя — попробуйте ещё раз.")
+            return
         _wizard_put(key, {
             "step": "name",
             "name": None,
@@ -3734,7 +3745,9 @@ async def _wizard_hook_impl(event: Any) -> Optional[Dict[str, Any]]:
         return None  # stale dialog: the text goes to the session as usual
     wizard_user = str(entry.get("user_id") or "").strip()
     sender = str(getattr(source, "user_id", "") or "").strip()
-    if wizard_user and sender and wizard_user != sender:
+    if not wizard_user:
+        return None  # unbound dialog (legacy/corrupt state) — fail open to the session
+    if sender != wizard_user:
         return None  # a different sender's text is not a dialog answer
 
     step = str(entry.get("step") or "").strip()

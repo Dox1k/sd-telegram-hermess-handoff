@@ -608,6 +608,31 @@ class CrossOriginTests(unittest.TestCase):
             mod._resume_command_for("sess-1", conn, "telegram"),
             "/resume sess-1")
 
+    def test_cross_origin_uses_caller_source_not_row_source(self):
+        """Regression (review P1): the resume paths must pass the CALLER's
+        source, never the target row's — ``_caller_source_value`` echoes an
+        explicit session_source, so passing row["source"] made cross_origin
+        always False and the IDOR guard blocked every desktop resume."""
+        conn = _FAKE_STATE.conn
+        conn.execute("INSERT INTO sessions (id, source) VALUES (?, ?)",
+                     ("sess-d", "desktop"))
+        conn.execute("INSERT INTO sessions (id, source) VALUES (?, ?)",
+                     ("sess-t", "telegram"))
+        conn.commit()
+
+        class _TeleSource:
+            platform = types.SimpleNamespace(value="telegram")
+            chat_type = "dm"
+            user_id = "111"
+
+        caller = _TeleSource()
+        # empty session_source: the caller's own platform decides
+        self.assertFalse(mod._session_is_same_source(conn, "sess-d", "", caller))
+        # explicit telegram session_source (the caller's): same decision
+        self.assertFalse(mod._session_is_same_source(conn, "sess-d", "telegram", caller))
+        # same-origin sanity: telegram row, telegram caller
+        self.assertTrue(mod._session_is_same_source(conn, "sess-t", "telegram", caller))
+
     def test_cross_origin_admin_gets_all(self):
         conn = _FAKE_STATE.conn
         conn.execute("INSERT INTO sessions (id, source) VALUES (?, ?)",
@@ -963,8 +988,10 @@ class TopicBindingTests(unittest.TestCase):
     def test_binding_key_requires_chat_and_thread(self):
         with _with_env(HERMES_SESSION_CHAT_ID="5", HERMES_SESSION_THREAD_ID="88888"):
             self.assertEqual(mod._topic_binding_key(), "5:88888")
+        # Topics off: the flat chat lane normalizes to thread 0
         with _with_env(HERMES_SESSION_CHAT_ID="5", HERMES_SESSION_THREAD_ID=""):
-            self.assertIsNone(mod._topic_binding_key())
+            self.assertEqual(mod._topic_binding_key(), "5:0")
+        # No telegram chat (desktop/CLI): nothing to bind
         with _with_env(HERMES_SESSION_CHAT_ID="", HERMES_SESSION_THREAD_ID="88888"):
             self.assertIsNone(mod._topic_binding_key())
 
@@ -989,10 +1016,12 @@ class TopicBindingTests(unittest.TestCase):
         # state bucket removed entirely when empty
         self.assertNotIn("topic_bindings", _STATE.data)
 
-    def test_set_binding_without_topic_fails(self):
+    def test_set_binding_flat_chat_lands_on_key_zero(self):
+        # Topics off: a binding WITHOUT a thread targets the flat lane <chat>:0
         with _with_env(HERMES_SESSION_CHAT_ID="5", HERMES_SESSION_THREAD_ID=""):
-            self.assertFalse(mod._set_topic_binding("p1", "x", "/p"))
-            self.assertIsNone(mod._get_topic_binding())
+            self.assertTrue(mod._set_topic_binding("p1", "x", "/p"))
+        state = mod._load_state()
+        self.assertEqual(state["topic_bindings"]["5:0"]["project_name"], "x")
 
     def test_update_binding_session_needs_existing_binding(self):
         with _with_env(HERMES_SESSION_CHAT_ID="5", HERMES_SESSION_THREAD_ID="88888"):
