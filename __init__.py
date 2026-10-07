@@ -1318,7 +1318,8 @@ def _columns_of(state_conn, table: str) -> set:
         return set()
 
 
-def _sessions_for_cwd(state_conn, cwd: str, limit: int = 2, source: Optional[str] = None) -> list:
+def _sessions_for_cwd(state_conn, cwd: str, limit: int = 2, source: Optional[str] = None,
+                      _extra_where: str = "") -> list:
     """Latest sessions whose cwd equals *cwd*, each with its last user message.
 
     Without *source* the query is cross-origin: desktop sessions created by the
@@ -1326,6 +1327,9 @@ def _sessions_for_cwd(state_conn, cwd: str, limit: int = 2, source: Optional[str
     the "continue where I left off on the phone" use case. ``source`` is kept
     in each row so the caller can flag them (a desktop session driven from two
     places at once interleaves history from two processes).
+    ``_extra_where`` appends a raw SQL predicate (caller-controlled constant
+    string, never user input) — used by the auto-adopt path to scope to one
+    chat_id.
     """
     rows = []
     try:
@@ -1343,6 +1347,8 @@ def _sessions_for_cwd(state_conn, cwd: str, limit: int = 2, source: Optional[str
         if source:
             sql += " AND source = ?"
             args.append(source)
+        if _extra_where:
+            sql += f" {_extra_where}"
         sql += " ORDER BY started_at DESC LIMIT ?"
         args.append(limit)
         order = _messages_order_col(state_conn)
@@ -3203,12 +3209,21 @@ async def _pb_pick_project(query, chat_id: str, thread_id: Optional[int],
     _pb_write_binding(chat_id, thread_id, getattr(project, "id", None),
                       getattr(project, "name", None), cwd, None)
     _mark_new_session_grace(chat_id, thread_id)
-    # The project has prior sessions: ASK — continue the latest or start a
-    # fresh chat. Auto-adopting the latest confused users ("my new project
-    # opened with someone else's history") when the cwd was a shared root
-    # (e.g. /mnt/mydisk itself). No sessions → the first turn creates one.
-    latest_id = _latest_session_id_for_cwd(cwd)
+    # The project has prior sessions: adopt the LATEST ACTIVE session for
+    # THIS CHAT automatically when one exists (owner decision 2026-10-07:
+    # "при выборе проекта выбирается последняя сессия этого чата" — the
+    # extra ask-screen made every re-pick a two-tap ritual). Only when the
+    # chat has no prior session in this cwd does the ask screen appear
+    # (continue-latest vs fresh). A desktop-only cwd session never
+    # auto-binds: it belongs to another process's lane.
+    latest_id = _latest_session_id_for_cwd(cwd, chat_id=str(chat_id))
     if latest_id:
+        _pb_write_binding_session(chat_id, thread_id, latest_id)
+        _NEW_SESSION_GRACE.pop(f"{chat_id}:{0 if thread_id is None else int(thread_id)}", None)
+        await _pb_pick_session_flow(query, chat_id, thread_id, latest_id)
+        return
+    generic_latest = _latest_session_id_for_cwd(cwd)
+    if generic_latest:
         state_conn = _sessions_state_conn()
         try:
             sessions = _sessions_for_cwd(state_conn, cwd, limit=_PB_SESSIONS_LIMIT)
@@ -3216,7 +3231,7 @@ async def _pb_pick_project(query, chat_id: str, thread_id: Optional[int],
             with _suppress(Exception):
                 state_conn.close()
         _pb_write_binding_session(chat_id, thread_id, None)  # unbound until picked
-        await _pb_pick_ask(query, project, latest_id, sessions)
+        await _pb_pick_ask(query, project, generic_latest, sessions)
         return
     await _pb_render(query, chat_id, thread_id)
 
@@ -3247,12 +3262,19 @@ async def _pb_pick_ask(query, project, latest_id: str, sessions: list) -> None:
             reply_markup=InlineKeyboardMarkup(rows))
 
 
-def _latest_session_id_for_cwd(cwd: str) -> str:
-    """The newest live/recent session id for *cwd*, or '' when there is none."""
+def _latest_session_id_for_cwd(cwd: str, chat_id: Optional[str] = None) -> str:
+    """The newest live/recent session id for *cwd*, or '' when there is none.
+
+    With *chat_id*: only sessions of THAT chat (the owner's lane) count —
+    the auto-adopt path must never grab another chat's (or a desktop
+    process's) session just because it shares the directory.
+    """
     try:
         state_conn = _sessions_state_conn()
         try:
-            rows = _sessions_for_cwd(state_conn, str(cwd or ""), limit=1)
+            source = f" AND chat_id = '{int(chat_id)}'" if chat_id else ""
+            rows = _sessions_for_cwd(state_conn, str(cwd or ""), limit=1,
+                                     _extra_where=source)
         finally:
             with _suppress(Exception):
                 state_conn.close()
@@ -3372,6 +3394,19 @@ async def _send_session_info(chat_id: str, thread_id: Optional[int],
         state = _load_state()
         state.setdefault("topic_info", {})[key] = int(message_id)
         _save_state(state)
+
+
+async def _pb_pick_session_flow(query, chat_id: str, thread_id: Optional[int],
+                                session_id: str) -> None:
+    """Auto-adopt continuation: bind + resume + info, like a session pick tap.
+
+    Split out of _pb_pick_session so the project-pick auto-adopt path reuses
+    the same UX without a callback query's prev_sid bookkeeping.
+    """
+    _pb_write_binding_session(chat_id, thread_id, session_id)
+    await _do_resume_by_id(query, session_id)
+    await _send_session_info(chat_id, thread_id, session_id)
+    await _pb_render(query, chat_id, thread_id)
 
 
 async def _pb_pick_session(query, chat_id: str, thread_id: Optional[int],

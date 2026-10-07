@@ -604,11 +604,11 @@ class PanelCallbackTests(_StubbedTestCase):
         self.assertIsNone(entry["session_id"])  # no seeded sessions: nothing to adopt
         self.assertEqual(query.edits[-1][0], f"📁  NeiroSlop\n🧵  —\n📂  {CWD}")
 
-    def test_projp_pick_asks_when_sessions_exist(self):
-        # Sessions exist in the project cwd: ASK first (continue latest /
-        # fresh chat) instead of silently adopting the latest — auto-adoption
-        # opened "someone else's history" on shared-root cwds.
-        _seed_session(SID, count=7)
+    def test_projp_pick_asks_when_only_other_chat_sessions_exist(self):
+        # Sessions exist in the project cwd, but NONE from this chat (e.g. a
+        # desktop session): no auto-adopt — the ask screen appears (continue
+        # latest / fresh chat) instead of silently binding another lane.
+        _seed_session(SID, count=7, chat="9999")
         query = self._tap("tgp:pb:projp:1")
         entry = _STATE_DATA["topic_bindings"][KEY]
         self.assertIsNone(entry["session_id"])  # not auto-bound
@@ -616,6 +616,19 @@ class PanelCallbackTests(_StubbedTestCase):
         self.assertEqual(rows[0][0].callback_data, f"tgp:pb:pick:{SID}")
         self.assertEqual(rows[1][0].callback_data, "tgp:pb:new")
         self.assertIn("Продолжить последнюю", query.edits[0][0])
+
+    def test_projp_pick_auto_adopts_latest_chat_session(self):
+        # Owner decision 2026-10-07: picking a project whose cwd has this
+        # CHAT's own sessions auto-adopts the latest one (bind + /resume +
+        # session info) — no ask screen, no "сессия ещё не выбрана".
+        _seed_session(SID, count=7)  # chat=CHAT by default
+        query = self._tap("tgp:pb:projp:1")
+        entry = _STATE_DATA["topic_bindings"][KEY]
+        self.assertEqual(entry["session_id"], SID)
+        self.assertTrue(any(getattr(e, "text", "") == f"/resume {SID}"
+                            for e in self.adapter.events))
+        # the grace stamp from the pick must be gone (a session is bound)
+        self.assertFalse(mod._new_session_grace_active(CHAT, THREAD))
 
     def test_projp_pick_then_continue_resumes_latest(self):
         # The [▶️ Продолжить] answer on the ask-screen behaves like a session
