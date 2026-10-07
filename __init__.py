@@ -1895,6 +1895,19 @@ def _path_outside_sandbox(raw_path: str, root: str) -> bool:
         return False
 
 
+# Interpreter / shell-tool tokens are never DATA paths: `cd /proj && /usr/bin/python3
+# -m py_compile x.py` runs INSIDE root — the executable being absolute does not
+# let the command escape the sandbox. Blocking them broke legit project work
+# (py_compile after a patch, venv pythons). Keep the list tight: shells and
+# script interpreters only, and require the exact canonical path (no subdirs).
+_SANDBOX_SAFE_EXECUTABLES = frozenset({
+    "/usr/bin/python3", "/usr/bin/python2", "/usr/bin/python",
+    "/usr/bin/env", "/usr/bin/make", "/usr/bin/node",
+    "/bin/sh", "/bin/bash", "/bin/dash", "/usr/bin/bash",
+    "/usr/local/bin/python3", "/usr/local/bin/python",
+})
+
+
 def _sandbox_check_terminal(command: str, root: str) -> Optional[str]:
     """Block message for a terminal command that leaves *root*, else None.
 
@@ -1911,7 +1924,9 @@ def _sandbox_check_terminal(command: str, root: str) -> Optional[str]:
                     "Команда заблокирована песочницей проекта.")
     for tok in re.findall(r"(?:^|[\s;&|(`=\[])(/[\w\-./'\"]+)", cmd):
         tok = tok.strip().strip("\"'")
-        if tok and _path_outside_sandbox(tok, root):
+        if not tok or tok in _SANDBOX_SAFE_EXECUTABLES:
+            continue
+        if _path_outside_sandbox(tok, root):
             return (f"⛔ Путь вне проекта ({root}): {tok}. "
                     "Команда заблокирована песочницей проекта.")
     return None

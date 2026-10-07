@@ -179,6 +179,24 @@ class SandboxTerminalTests(_StubbedTestCase):
     def test_plain_command_allowed(self):
         self.assertIsNone(mod._sandbox_check_terminal("ls -la && git status", self.root))
 
+    def test_interpreter_absolute_path_allowed(self):
+        # /usr/bin/python3 is an executable, not a data path: it must not trip
+        # the sandbox when the command already cd's into the project root.
+        self.assertIsNone(mod._sandbox_check_terminal(
+            "cd /mnt/mydisk/sd1 && /usr/bin/python3 -m py_compile __init__.py",
+            self.root))
+
+    def test_data_path_after_interpreter_still_blocked(self):
+        # The interpreter is fine, but a REAL outside data path must still block.
+        self.assertIsNotNone(mod._sandbox_check_terminal(
+            "cd /mnt/mydisk/sd1 && /usr/bin/python3 /mnt/mydisk/ambrozia/x.py",
+            self.root))
+
+    def test_random_usr_bin_binary_blocked(self):
+        # Not a whitelisted interpreter -> still treated as a path.
+        self.assertIsNotNone(mod._sandbox_check_terminal(
+            "cd /mnt/mydisk/sd1 && /usr/bin/curl https://x", self.root))
+
 
 @unittest.skipUnless(_HAS_PLUGIN, "TGP_PLUGIN_DIR not set")
 class SandboxHookTests(_StubbedTestCase):
