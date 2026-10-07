@@ -1834,6 +1834,125 @@ def _on_pre_llm_call(**kwargs) -> None:
         logger.warning("tg-projects: pre_llm_call failed", exc_info=True)
 
 
+# ------------------------------------------------------------- project sandbox
+# pre_tool_call: a session bound to a project cwd must not touch files OUTSIDE
+# it. The agent receives cwd as its working directory, but nothing in the core
+# enforces it — a model free to "continue the last task" once walked into
+# another project's tree (Ambrozia from a NeiroSlop chat). This hook is the
+# guard: path-carrying tools are checked against the CURRENT session's cwd
+# (state.db sessions.cwd, written by _apply_session_cwd); a target outside
+# the project root is BLOCKED with a message that names the sandbox.
+_SANDBOX_PATH_TOOLS = {
+    "read_file": ("path",),
+    "write_file": ("path",),
+    "patch": ("path",),
+    "search_files": ("path",),
+    "vision_analyze": ("image_url",),
+    "text_to_speech": ("output_path",),
+}
+_SANDBOX_ALWAYS_ALLOWED = {
+    # read-only / non-filesystem tools never touch the project tree
+    "web_search", "web_extract", "browser_exec", "browser_vault_list",
+    "clarify", "memory", "skill_view", "skills_list", "todo_list",
+    "delegate_task", "tool_search", "tool_describe", "tool_call",
+}
+
+
+def _sandbox_session_cwd(session_id: str) -> str:
+    """The session's recorded cwd (state.db), '' when unset/unreadable."""
+    sid = str(session_id or "").strip()
+    if not sid:
+        return ""
+    try:
+        conn = _open_state_db()
+        if conn is None:
+            return ""
+        try:
+            row = conn.execute("SELECT cwd FROM sessions WHERE id = ?", (sid,)).fetchone()
+        finally:
+            with _suppress(Exception):
+                conn.close()
+        return str(row["cwd"] or "").strip() if row is not None else ""
+    except Exception:
+        return ""
+
+
+def _path_outside_sandbox(raw_path: str, root: str) -> bool:
+    """True when *raw_path* (possibly relative) resolves outside *root*.
+
+    Relative paths resolve against the session cwd (= root) — they stay inside
+    unless they climb out with '..'. Non-path values (URLs, ':memory:', empty)
+    never block.
+    """
+    p = str(raw_path or "").strip()
+    if not p or p.startswith(("http://", "https://", "data:")) or p == ":memory:":
+        return False
+    try:
+        root_real = os.path.realpath(root)
+        target = os.path.realpath(os.path.join(root, p))
+        return os.path.commonpath([root_real, target]) != root_real
+    except Exception:
+        return False
+
+
+def _sandbox_check_terminal(command: str, root: str) -> Optional[str]:
+    """Block message for a terminal command that leaves *root*, else None.
+
+    Extracts cd targets and absolute-path tokens heuristically; a command with
+    no path signal is allowed (the shell's cwd is the project root — a plain
+    `ls` cannot escape it).
+    """
+    cmd = str(command or "").strip()
+    if not cmd:
+        return None
+    for target in re.findall(r"(?:^|&&|;|\|)\s*cd\s+([^\s;&|]+)", cmd):
+        if _path_outside_sandbox(target, root):
+            return (f"⛔ Каталог вне проекта ({root}): cd {target}. "
+                    "Команда заблокирована песочницей проекта.")
+    for tok in re.findall(r"(?:^|[\s;&|(`=\[])(/[\w\-./'\"]+)", cmd):
+        tok = tok.strip().strip("\"'")
+        if tok and _path_outside_sandbox(tok, root):
+            return (f"⛔ Путь вне проекта ({root}): {tok}. "
+                    "Команда заблокирована песочницей проекта.")
+    return None
+
+
+def _on_pre_tool_call(tool_name: str = "", args: Optional[Dict[str, Any]] = None,
+                      task_id: str = "", session_id: str = "",
+                      tool_call_id: str = "", **_: Any) -> Optional[Dict[str, Any]]:
+    """Project-sandbox gate for path-carrying tools; None/None = proceed.
+
+    Only sessions with a RECORDED project cwd (state.db sessions.cwd, set by
+    this plugin's binding flow) are sandboxed; CLI/desktop/global turns and
+    unbound chats are untouched. Fail-open on any internal error: a broken
+    guard must not brick the agent.
+    """
+    try:
+        if not tool_name or tool_name in _SANDBOX_ALWAYS_ALLOWED:
+            return None
+        root = _sandbox_session_cwd(session_id or task_id)
+        if not root or not os.path.isdir(root):
+            return None
+        if tool_name == "terminal":
+            block = _sandbox_check_terminal(str((args or {}).get("command") or ""), root)
+            if block:
+                logger.info("tg-projects: sandbox blocked terminal in %s", root)
+                return {"action": "block", "message": block}
+            return None
+        for key in _SANDBOX_PATH_TOOLS.get(tool_name, ()):
+            val = (args or {}).get(key)
+            if val and _path_outside_sandbox(str(val), root):
+                msg = (f"⛔ Путь вне проекта ({root}): {val}. "
+                       "Инструмент заблокирован песочницей проекта.")
+                logger.info("tg-projects: sandbox blocked %s(%s) in %s",
+                            tool_name, key, root)
+                return {"action": "block", "message": msg}
+        return None
+    except Exception:
+        logger.warning("tg-projects: sandbox pre_tool_call failed", exc_info=True)
+        return None
+
+
 # ----------------------------------------------------------------- keyboard builders
 # One project-list page: with 5+ projects the list paginates (tgp:pl:<offset>).
 _PROJECTS_PER_PAGE = 5
@@ -4151,6 +4270,14 @@ def register(ctx) -> None:
     # session without a pin, /resume'd sessions): applies the topic->project
     # cwd on the first turn instead. Idempotent via _CWD_APPLIED.
     ctx.register_hook("pre_llm_call", _on_pre_llm_call)
+    # Project sandbox: pre_tool_call blocks path-carrying tools/terminal
+    # commands that leave the session's project cwd (state.db sessions.cwd).
+    try:
+        ctx.register_hook("pre_tool_call", _on_pre_tool_call)
+        logger.info("tg-projects: sandbox pre_tool_call hook registered")
+    except Exception:
+        logger.warning("tg-projects: sandbox hook registration failed",
+                       exc_info=True)
     # Lazy prune of stale topic bindings/panels at start; never fatal.
     try:
         _prune_stale_state()
