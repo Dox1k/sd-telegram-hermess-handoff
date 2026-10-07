@@ -498,6 +498,41 @@ async def _send_pick_notice(chat_id: str, thread_id: Any) -> None:
         "Проект выбран, но сессия ещё не выбрана: /menu → [🧵 Сессия] или [➕ Новая].")
 
 
+# ------------------------------------------------------ /new grace window
+# A [➕ Новая] tap (or /new) only CREATES the gateway session row; the topic
+# binding's session_id is recorded later, by on_session_start on the FIRST
+# real text turn. Between the two the binding sits at session_id=None while
+# the cwd still has older sessions — the pick-screen guard would eat the
+# user's first message. This per-lane timestamp opens a short window where
+# "binding set, no session yet" lets the text through so the first turn can
+# bind itself. Fail-open: an expired/absent stamp just falls back to the
+# pick screen.
+_NEW_SESSION_GRACE_S = 600.0  # 10 min to type the first message
+_NEW_SESSION_GRACE: Dict[str, float] = {}
+
+
+def _mark_new_session_grace(chat_id: Any, thread_id: Any) -> None:
+    tid = _norm_thread_id(thread_id)
+    key = f"{chat_id}:{0 if tid is None else tid}"
+    _NEW_SESSION_GRACE[key] = time.time()
+    # bound the dict: drop stamps older than 2 windows
+    cutoff = time.time() - 2 * _NEW_SESSION_GRACE_S
+    for k in [k for k, ts in _NEW_SESSION_GRACE.items() if ts < cutoff]:
+        _NEW_SESSION_GRACE.pop(k, None)
+
+
+def _new_session_grace_active(chat_id: Any, thread_id: Any) -> bool:
+    tid = _norm_thread_id(thread_id)
+    key = f"{chat_id}:{0 if tid is None else tid}"
+    ts = _NEW_SESSION_GRACE.get(key, 0.0)
+    if not ts:
+        return False
+    if time.time() - ts > _NEW_SESSION_GRACE_S:
+        _NEW_SESSION_GRACE.pop(key, None)
+        return False
+    return True
+
+
 async def _on_pre_gateway_dispatch_sync(event, gateway, session_store=None, **kwargs):
     """``pre_gateway_dispatch`` — seamless topic sync (fail-open, never blocks).
 
@@ -574,6 +609,15 @@ async def _on_pre_gateway_dispatch_sync(event, gateway, session_store=None, **kw
         bound_sid = str(binding.get("session_id") or "").strip()
         if not bound_sid:
             if _latest_session_id_for_cwd(str(binding.get("cwd") or "")):
+                # Grace for a /new-STARTED session: /new only CREATES the
+                # gateway session; the chat's first real text is its first
+                # turn, where on_session_start records the binding. The cwd
+                # still has OLD sessions, so without this window the very
+                # first "привет" after [➕ Новая] was swallowed by the
+                # pick-screen nudge and the chat sat dead (2026-10-07: two
+                # /new sessions created, zero messages, user repelled).
+                if _new_session_grace_active(chat_id, tid):
+                    return None
                 _panel = globals().get("_ensure_topic_panel")
                 if callable(_panel):
                     with _suppress(Exception):
@@ -2894,6 +2938,9 @@ def _pb_write_binding_session(chat_id: str, thread_id: Optional[int],
         entry["updated_at"] = int(time.time())
         bindings[key] = entry
         _save_state(state)
+    if clean:
+        # A session was actually picked/resumed: the lane is live, no grace.
+        _NEW_SESSION_GRACE.pop(key, None)
     return True
 
 
@@ -3155,6 +3202,7 @@ async def _pb_pick_project(query, chat_id: str, thread_id: Optional[int],
         return
     _pb_write_binding(chat_id, thread_id, getattr(project, "id", None),
                       getattr(project, "name", None), cwd, None)
+    _mark_new_session_grace(chat_id, thread_id)
     # The project has prior sessions: ASK — continue the latest or start a
     # fresh chat. Auto-adopting the latest confused users ("my new project
     # opened with someone else's history") when the cwd was a shared root
@@ -3388,6 +3436,7 @@ async def _pb_new_session(query, chat_id: str, thread_id: Optional[int]) -> None
             await query.edit_message_text("➕ Сначала выбери проект: [📁 Проект].",
                                           reply_markup=_pb_back_keyboard())
         return
+    _mark_new_session_grace(chat_id, thread_id)
     project = _make_light_project(str(binding.get("project_name")),
                                   str(binding["cwd"]), binding.get("project_id"))
     state_conn = _sessions_state_conn()

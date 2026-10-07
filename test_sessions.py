@@ -24,7 +24,8 @@ import unittest
 from contextlib import contextmanager
 from pathlib import Path
 
-PLUGIN_DIR = Path("/home/meow/.hermes/plugins/tg-projects")
+PLUGIN_DIR = Path(os.environ.get("TGP_PLUGIN_DIR")
+                  or Path(__file__).resolve().parent)
 
 
 # ----------------------------------------------------------------- core stubs
@@ -807,6 +808,68 @@ class SyncHookFlatTests(unittest.TestCase):
             mod._open_state_db = orig
             conn.close()
         self.assertEqual(result, {"action": "skip", "reason": "awaiting_session_pick"})
+
+    def _bind_flat_with_old_session(self):
+        """Binding with session_id=None AND an older session in the cwd."""
+        self._bind_flat()
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        conn.execute("CREATE TABLE sessions (id TEXT PRIMARY KEY, source TEXT,"
+                     " cwd TEXT, started_at REAL, ended_at REAL, title TEXT,"
+                     " chat_id TEXT, thread_id TEXT, message_count INTEGER,"
+                     " last_activity_at REAL)")
+        conn.execute("INSERT INTO sessions VALUES ('s_old', 'telegram',"
+                     " '/mnt/mydisk/sd1', 1791310000.0, NULL, 'Старая',"
+                     " '7559860199', NULL, 3, 1791310000.0)")
+        conn.execute("CREATE TABLE messages (session_id TEXT, role TEXT,"
+                     " content TEXT)")
+        return conn
+
+    def test_new_session_grace_lets_first_text_through(self):
+        # Regression 2026-10-07: [➕ Новая] created the gateway session, but
+        # the binding's session_id stays None until the first text turn —
+        # and the cwd still has OLDER sessions, so the pick-screen guard ate
+        # the user's first "привет". The grace window must let it through.
+        self._bind_flat()
+        conn = self._bind_flat_with_old_session()
+        orig = mod._open_state_db
+        mod._open_state_db = lambda: conn
+        try:
+            mod._mark_new_session_grace("7559860199", None)
+            with _with_env(HERMES_HOME="/nonexistent-sync-tmp"):
+                result = asyncio_run(
+                    mod._on_pre_gateway_dispatch_sync(self._event("привет"), None))
+        finally:
+            mod._open_state_db = orig
+            conn.close()
+            mod._NEW_SESSION_GRACE.clear()
+        self.assertIsNone(result)
+
+    def test_expired_grace_still_asks_for_pick(self):
+        # Grace expired -> the pick screen guard works as before.
+        self._bind_flat()
+        conn = self._bind_flat_with_old_session()
+        orig = mod._open_state_db
+        mod._open_state_db = lambda: conn
+        try:
+            mod._mark_new_session_grace("7559860199", None)
+            mod._NEW_SESSION_GRACE["7559860199:0"] -= mod._NEW_SESSION_GRACE_S + 1
+            with _with_env(HERMES_HOME="/nonexistent-sync-tmp"):
+                result = asyncio_run(
+                    mod._on_pre_gateway_dispatch_sync(self._event("привет"), None))
+        finally:
+            mod._open_state_db = orig
+            conn.close()
+            mod._NEW_SESSION_GRACE.clear()
+        self.assertEqual(result, {"action": "skip", "reason": "awaiting_session_pick"})
+
+    def test_pick_clears_grace(self):
+        self._bind_flat()  # _pb_write_binding_session needs an existing binding row
+        mod._mark_new_session_grace("7559860199", None)
+        self.assertTrue(mod._new_session_grace_active("7559860199", None))
+        mod._pb_write_binding_session("7559860199", None, "sess-x")
+        self.assertFalse(mod._new_session_grace_active("7559860199", None))
+        mod._NEW_SESSION_GRACE.clear()
 
     def test_no_binding_at_all_still_redirects_to_menu(self):
         result = asyncio_run(mod._on_pre_gateway_dispatch_sync(self._event("привет"), None))
