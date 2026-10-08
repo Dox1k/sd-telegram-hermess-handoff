@@ -793,11 +793,12 @@ class SyncHookFlatTests(unittest.TestCase):
                      " cwd TEXT, started_at REAL, ended_at REAL, title TEXT,"
                      " chat_id TEXT, thread_id TEXT, message_count INTEGER,"
                      " last_activity_at REAL)")
-        conn.execute("INSERT INTO sessions VALUES ('s_old', 'telegram',"
-                     " '/mnt/mydisk/sd1', 1791310000.0, NULL, 'Старая',"
-                     " '7559860199', NULL, 3, 1791310000.0)")
         conn.execute("CREATE TABLE messages (session_id TEXT, role TEXT,"
                      " content TEXT)")
+        recent = time.time()
+        conn.execute("INSERT INTO sessions VALUES ('s_old', 'telegram',"
+                     " '/mnt/mydisk/sd1', ?, NULL, 'Старая',"
+                     " '7559860199', NULL, 3, ?)", (recent, recent))
         orig = mod._open_state_db
         mod._open_state_db = lambda: conn
         try:
@@ -807,9 +808,13 @@ class SyncHookFlatTests(unittest.TestCase):
         finally:
             mod._open_state_db = orig
             conn.close()
-        self.assertEqual(result, {"action": "skip", "reason": "awaiting_session_pick"})
+        # A cwd WITH sessions for this same Telegram chat: adopt that lane
+        # automatically instead of forcing a redundant pick screen.
+        self.assertIsNone(result)
+        binding = mod._binding_at("7559860199", 0)
+        self.assertEqual(binding.get("session_id"), "s_old")
 
-    def _bind_flat_with_old_session(self):
+    def _bind_flat_with_old_session(self, chat_id="7559860199"):
         """Binding with session_id=None AND an older session in the cwd."""
         self._bind_flat()
         conn = sqlite3.connect(":memory:")
@@ -818,9 +823,10 @@ class SyncHookFlatTests(unittest.TestCase):
                      " cwd TEXT, started_at REAL, ended_at REAL, title TEXT,"
                      " chat_id TEXT, thread_id TEXT, message_count INTEGER,"
                      " last_activity_at REAL)")
+        recent = time.time()
         conn.execute("INSERT INTO sessions VALUES ('s_old', 'telegram',"
-                     " '/mnt/mydisk/sd1', 1791310000.0, NULL, 'Старая',"
-                     " '7559860199', NULL, 3, 1791310000.0)")
+                     " '/mnt/mydisk/sd1', ?, NULL, 'Старая',"
+                     " ?, NULL, 3, ?)", (chat_id, recent, recent))
         conn.execute("CREATE TABLE messages (session_id TEXT, role TEXT,"
                      " content TEXT)")
         return conn
@@ -846,11 +852,14 @@ class SyncHookFlatTests(unittest.TestCase):
         self.assertIsNone(result)
 
     def test_expired_grace_still_asks_for_pick(self):
-        # Grace expired -> the pick screen guard works as before.
+        # Grace expired -> a different chat's session still requires a pick.
         self._bind_flat()
-        conn = self._bind_flat_with_old_session()
+        conn = self._bind_flat_with_old_session(chat_id="other-chat")
         orig = mod._open_state_db
+        orig_latest = mod._latest_session_id_for_cwd
         mod._open_state_db = lambda: conn
+        mod._latest_session_id_for_cwd = (
+            lambda cwd, chat_id=None: "" if chat_id else "s_old")
         try:
             mod._mark_new_session_grace("7559860199", None)
             mod._NEW_SESSION_GRACE["7559860199:0"] -= mod._NEW_SESSION_GRACE_S + 1
@@ -859,6 +868,7 @@ class SyncHookFlatTests(unittest.TestCase):
                     mod._on_pre_gateway_dispatch_sync(self._event("привет"), None))
         finally:
             mod._open_state_db = orig
+            mod._latest_session_id_for_cwd = orig_latest
             conn.close()
             mod._NEW_SESSION_GRACE.clear()
         self.assertEqual(result, {"action": "skip", "reason": "awaiting_session_pick"})

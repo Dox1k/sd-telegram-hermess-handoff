@@ -492,8 +492,15 @@ class PanelTextTests(_StubbedTestCase):
         _seed_session(SID, lease_until=time.time() + 300)
         _seed_session("20261002_101500_0d0fd7", source="desktop", started=1791200000.0,
                       count=5)
+        _seed_session("20261004_101500_subagent", source="subagent", started=time.time(),
+                      count=9)
+        _FAKE_STATE.conn.execute("ALTER TABLE sessions ADD COLUMN parent_session_id TEXT")
+        _FAKE_STATE.conn.execute(
+            "UPDATE sessions SET parent_session_id = ? WHERE id = ?", (SID, "20261004_101500_subagent"))
+        _FAKE_STATE.conn.commit()
         sessions = mod._sessions_for_cwd(_FAKE_STATE.conn, CWD, limit=mod._PB_SESSIONS_LIMIT)
         self.assertEqual(len(sessions), 2)
+        self.assertTrue(all(s["source"] in ("telegram", "desktop") for s in sessions))
         text = mod._pb_sessions_text(_binding_entry(SID), sessions)
         self.assertIn("🧵 Сессии проекта NeiroSlop:", text)
         self.assertIn("• 20261003_062… · online · 12 msg", text)
@@ -580,8 +587,62 @@ class PanelCallbackTests(_StubbedTestCase):
         _STATE_DATA["topic_bindings"] = {KEY: _binding_entry(None)}
         query = self._tap("tgp:pb:back")
         self.assertEqual(query.edits[0][0], f"📁  NeiroSlop\n🧵  —\n📂  {CWD}")
-        self.assertEqual(query.edits[0][1].rows[0][0].callback_data, "tgp:pb:proj")
-        self.assertEqual(query.edits[0][1].rows[1][1].callback_data, "tgp:pb:more")
+        kb = query.edits[0][1]
+        flat = [b.callback_data for row in kb.rows for b in row]
+        self.assertEqual(flat, ["tgp:pb:proj", "tgp:pb:more"])
+
+    def test_back_with_live_session_shows_session_and_stop(self):
+        _STATE_DATA["topic_bindings"] = {KEY: _binding_entry(SID)}
+        _seed_session(SID, lease_until=time.time() + 300)
+        query = self._tap("tgp:pb:back")
+        self.assertEqual(query.edits[0][0],
+                         f"📁  NeiroSlop\n🧵  20261003_062… · 12 msg · online\n📂  {CWD}")
+        kb = query.edits[0][1]
+        flat = [b.callback_data for row in kb.rows for b in row]
+        self.assertEqual(flat, ["tgp:pb:proj", "tgp:pb:sess", "tgp:pb:stop", "tgp:pb:more"])
+        self.assertEqual([len(row) for row in kb.rows], [2, 2])
+
+    def test_project_command_is_menu_alias(self):
+        _STATE_DATA["topic_bindings"] = {KEY: _binding_entry(None)}
+        with _with_env(HERMES_SESSION_CHAT_ID=CHAT,
+                       HERMES_SESSION_THREAD_ID=str(THREAD)):
+            result = _run(mod._projects_handler(""))
+        self.assertIsNone(result)
+        self.assertEqual(len(self.bot.sent), 1)
+        self.assertEqual(self.bot.sent[0]["message_thread_id"], THREAD)
+        self.assertEqual(self.bot.sent[0]["text"],
+                         f"📁  NeiroSlop\n🧵  —\n📂  {CWD}")
+        flat = [b.callback_data for row in self.bot.sent[0]["reply_markup"].rows for b in row]
+        self.assertEqual(flat, ["tgp:pb:proj", "tgp:pb:more"])
+        self.assertEqual(self.bot.pinned[0]["chat_id"], int(CHAT))
+        self.assertEqual(_STATE_DATA["topic_panels"][KEY],
+                         self.bot.pinned[0]["message_id"])
+
+    def test_project_command_rejects_args(self):
+        self.assertEqual(_run(mod._projects_handler("x")),
+                         "Использование: /projects — без аргументов.")
+        self.assertEqual(self.bot.sent, [])
+
+    def test_project_command_without_bot_returns_text(self):
+        mod._NATIVE = None
+        with _with_env(HERMES_SESSION_CHAT_ID=CHAT, HERMES_SESSION_THREAD_ID=""):
+            result = _run(mod._projects_handler(""))
+        self.assertIn("недоступна", result)
+        self.assertEqual(self.bot.sent, [])
+
+    def test_sesss_pick_folds_summary_into_panel_without_extra_message(self):
+        _STATE_DATA["topic_bindings"] = {KEY: _binding_entry(None)}
+        _seed_session(SID)
+        _FAKE_STATE.conn.execute(
+            "INSERT INTO messages (session_id, role, content) VALUES (?,?,?)",
+            (SID, "user", "продолжи миграцию"))
+        _FAKE_STATE.conn.commit()
+        with _with_env(HERMES_HOME="/nonexistent-panel-tmp"):
+            query = self._tap(f"tgp:pb:sesss:{SID}")
+        self.assertEqual(_STATE_DATA["topic_bindings"][KEY]["session_id"], SID)
+        self.assertIn("продолжи миграцию", query.edits[-1][0])
+        self.assertIn("🧵  20261003_062…", query.edits[-1][0])
+        self.assertEqual(self.bot.sent, [])
 
     def test_back_without_binding_shows_hint(self):
         query = self._tap("tgp:pb:back")

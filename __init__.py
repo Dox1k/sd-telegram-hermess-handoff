@@ -599,23 +599,25 @@ async def _on_pre_gateway_dispatch_sync(event, gateway, session_store=None, **kw
                     _panel(chat_id, tid)
             return {"action": "skip", "reason": "unbound_topic"}
 
-        # Project bound, session not yet recorded: when the cwd has sessions,
-        # the user must PICK (or explicitly start fresh via _pb_pick_project's
-        # ask-screen — session stays null): silent adoption of the cwd's
-        # LATEST session opened "someone else's history" on shared-root cwds.
-        # A cwd with NO sessions lets the text through — the first turn
-        # creates and binds the session (on_session_start); blocking here
-        # deadlocked the first turn after /new.
+        # Project bound, session not yet recorded: adopt this Telegram chat's
+        # latest session in the same cwd; never adopt another chat's or the
+        # desktop's history. Only ask when the cwd has sessions but none for
+        # this chat; with no sessions, let the first turn create one.
         bound_sid = str(binding.get("session_id") or "").strip()
         if not bound_sid:
-            if _latest_session_id_for_cwd(str(binding.get("cwd") or "")):
-                # Grace for a /new-STARTED session: /new only CREATES the
-                # gateway session; the chat's first real text is its first
-                # turn, where on_session_start records the binding. The cwd
-                # still has OLD sessions, so without this window the very
-                # first "привет" after [➕ Новая] was swallowed by the
-                # pick-screen nudge and the chat sat dead (2026-10-07: two
-                # /new sessions created, zero messages, user repelled).
+            chat_sid = _latest_session_id_for_cwd(
+                str(binding.get("cwd") or ""), chat_id=chat_id)
+            if chat_sid:
+                with _CWD_LOCK:
+                    state = _load_state()
+                    entry = (state.get("topic_bindings") or {}).get(f"{chat_id}:{tid}")
+                    if isinstance(entry, dict):
+                        entry["session_id"] = chat_sid
+                        entry["updated_at"] = int(time.time())
+                        _save_state(state)
+                _NEW_SESSION_GRACE.pop(f"{chat_id}:{tid}", None)
+                bound_sid = chat_sid
+            elif _latest_session_id_for_cwd(str(binding.get("cwd") or "")):
                 if _new_session_grace_active(chat_id, tid):
                     return None
                 _panel = globals().get("_ensure_topic_panel")
@@ -624,7 +626,8 @@ async def _on_pre_gateway_dispatch_sync(event, gateway, session_store=None, **kw
                         _panel(chat_id, tid)
                 await _send_pick_notice(chat_id, tid)
                 return {"action": "skip", "reason": "awaiting_session_pick"}
-            return None
+            else:
+                return None
 
         # Bound topic: steer the lane onto binding.session_id when drifted.
         store = session_store if session_store is not None else getattr(
@@ -1347,8 +1350,15 @@ def _sessions_for_cwd(state_conn, cwd: str, limit: int = 2, source: Optional[str
         if source:
             sql += " AND source = ?"
             args.append(source)
+        else:
+            placeholders = ", ".join("?" for _ in _VISIBLE_SESSION_SOURCES)
+            sql += f" AND source IN ({placeholders})"
+            args.extend(_VISIBLE_SESSION_SOURCES)
         if _extra_where:
             sql += f" {_extra_where}"
+        columns = _columns_of(state_conn, "sessions")
+        if "parent_session_id" in columns:
+            sql += " AND parent_session_id IS NULL"
         sql += " ORDER BY started_at DESC LIMIT ?"
         args.append(limit)
         order = _messages_order_col(state_conn)
@@ -1549,42 +1559,10 @@ def _plain_sessions_text(proj, index: int, cwd: str | None, state_conn) -> str:
 
 # ------------------------------------------------------------------------ /projects
 async def _projects_handler(raw_args: str) -> str | None:
+    """Temporary compatibility alias: /projects opens the same primary panel."""
     if raw_args and raw_args.strip():
         return "Использование: /projects — без аргументов."
-
-    try:
-        projects = _list_projects()
-    except Exception as exc:
-        return f"Не удалось прочитать projects.db: {exc}"
-    if not projects:
-        return "Проектов пока нет."
-
-    state_conn = _sessions_state_conn()
-    try:
-        # The command handler returns only a str. When the Telegram factory has
-        # run, send the inline keyboard ourselves (chat id/thread from the
-        # session env); otherwise (or without a chat id) return the text form.
-        # NOTE: the gateway awaits coroutine handlers (run_inbound.py:1134), so
-        # this handler is async and bot.send_message is properly awaited — a
-        # plain call used to die with "coroutine was never awaited".
-        bot = getattr(_NATIVE, "bot", None) if _NATIVE is not None else None
-        if _NATIVE is not None and bot is not None:
-            chat_id = _session_env("HERMES_SESSION_CHAT_ID", "")
-            thread_id = _session_env("HERMES_SESSION_THREAD_ID", "")
-            if chat_id:
-                kwargs = {"chat_id": chat_id, "text": "Проекты — выберите каталог:",
-                          "reply_markup": _project_list_keyboard(projects)}
-                if thread_id:
-                    kwargs["message_thread_id"] = int(thread_id) if thread_id.isdigit() else thread_id
-                await bot.send_message(**kwargs)
-                return None  # the keyboard is the visible answer
-            return _plain_projects_text(projects, state_conn) + "\n" + _plain_projects_notice()
-        return _plain_projects_text(projects, state_conn)
-    finally:
-        try:
-            state_conn.close()
-        except Exception:
-            pass
+    return await _menu_command("")
 
 
 # ------------------------------------------------------------------------ /pnew
@@ -2852,6 +2830,7 @@ def _telegram_wire(native: Any, adapter: Any) -> None:
 # _set_topic_binding's contextvar key is unavailable in a callback).
 _PB_CB_PREFIX = "tgp:pb:"
 _PB_SESSIONS_LIMIT = 20
+_VISIBLE_SESSION_SOURCES = ("telegram", "desktop")
 _PB_CB_PROJ_RE = re.compile(r"^tgp:pb:projp:(\d+)$")
 _PB_CB_SESS_RE = re.compile(r"^tgp:pb:sesss:([A-Za-z0-9_\-]{8,46})$")
 _PB_CB_PICK_RE = re.compile(r"^tgp:pb:pick:([A-Za-z0-9_\-]{8,46})$")
@@ -3012,6 +2991,23 @@ def _pb_panel_session_line(session_id: str, status: str) -> str:
         return f"{_pb_short_session_id(session_id)} · {status or 'idle'}"
 
 
+def _pb_panel_last_user_summary(session_id: str) -> str:
+    """The single latest user line folded into the pinned panel body."""
+    sid = str(session_id or "").strip()
+    if not sid:
+        return ""
+    try:
+        state_conn = _sessions_state_conn()
+        try:
+            lines = _last_user_lines(state_conn, sid, limit=1)
+        finally:
+            with _suppress(Exception):
+                state_conn.close()
+        return str(lines[0] or "").strip() if lines else ""
+    except Exception:
+        return ""
+
+
 def _pb_panel_text(binding: Optional[Dict[str, Any]], status: str = "") -> str:
     """The pinned panel body: project / live session digest / cwd."""
     if not binding:
@@ -3022,22 +3018,34 @@ def _pb_panel_text(binding: Optional[Dict[str, Any]], status: str = "") -> str:
         return "💬  Разговорник (без проекта)\n🧵  —\n📂  —"
     session_id = str(binding.get("session_id") or "").strip()
     session_line = _pb_panel_session_line(session_id, status) if session_id else "—"
+    summary = _pb_panel_last_user_summary(session_id) if session_id else ""
+    tail = f"\n🗒  {summary}" if summary else ""
     return (
         f"📁  {project_name or '—'}\n"
         f"🧵  {session_line}\n"
-        f"📂  {cwd or '—'}"
+        f"📂  {cwd or '—'}{tail}"
     )
 
 
-def _pb_panel_keyboard():
+def _pb_panel_keyboard(binding: Optional[Dict[str, Any]] = None, status: str = ""):
+    """Compact primary keyboard: contextual Session/Stop, always Проект + Ещё."""
     from telegram import InlineKeyboardButton, InlineKeyboardMarkup
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📁 Проект", callback_data=f"{_PB_CB_PREFIX}proj"),
-         InlineKeyboardButton("🧵 Сессия", callback_data=f"{_PB_CB_PREFIX}sess"),
-         InlineKeyboardButton("➕ Новая", callback_data=f"{_PB_CB_PREFIX}new")],
-        [InlineKeyboardButton("⏹ Stop", callback_data=f"{_PB_CB_PREFIX}stop"),
-         InlineKeyboardButton("⚙️ Ещё", callback_data=f"{_PB_CB_PREFIX}more")],
-    ])
+    session_id = ""
+    if binding:
+        session_id = str(binding.get("session_id") or "").strip()
+    show_session = bool(session_id)
+    show_stop = show_session and str(status or "").lower() == "online"
+    rows: list = []
+    first_row = [InlineKeyboardButton("📁 Проект", callback_data=f"{_PB_CB_PREFIX}proj")]
+    if show_session:
+        first_row.append(InlineKeyboardButton("🧵 Сессия", callback_data=f"{_PB_CB_PREFIX}sess"))
+    rows.append(first_row)
+    second_row: list = []
+    if show_stop:
+        second_row.append(InlineKeyboardButton("⏹ Stop", callback_data=f"{_PB_CB_PREFIX}stop"))
+    second_row.append(InlineKeyboardButton("⚙️ Ещё", callback_data=f"{_PB_CB_PREFIX}more"))
+    rows.append(second_row)
+    return InlineKeyboardMarkup(rows)
 
 
 def _pb_back_keyboard():
@@ -3078,7 +3086,7 @@ async def _pb_create(chat_id: str, thread_id: Optional[int]) -> bool:
     kwargs: Dict[str, Any] = {
         "chat_id": chat_id,
         "text": _pb_panel_text(binding, status),
-        "reply_markup": _pb_panel_keyboard(),
+        "reply_markup": _pb_panel_keyboard(binding, status),
     }
     if thread_id:
         kwargs["message_thread_id"] = int(thread_id)
@@ -3149,7 +3157,7 @@ async def _pb_render(query, chat_id: str, thread_id: Optional[int]) -> None:
                 state_conn.close()
     with _suppress(Exception):
         await query.edit_message_text(_pb_panel_text(binding, status),
-                                      reply_markup=_pb_panel_keyboard())
+                                      reply_markup=_pb_panel_keyboard(binding, status))
 
 
 async def _pb_project_screen(query, chat_id: str, thread_id: Optional[int]) -> None:
@@ -3405,7 +3413,6 @@ async def _pb_pick_session_flow(query, chat_id: str, thread_id: Optional[int],
     """
     _pb_write_binding_session(chat_id, thread_id, session_id)
     await _do_resume_by_id(query, session_id)
-    await _send_session_info(chat_id, thread_id, session_id)
     await _pb_render(query, chat_id, thread_id)
 
 
@@ -3456,10 +3463,8 @@ async def _pb_pick_session(query, chat_id: str, thread_id: Optional[int],
     _pb_write_binding_session(chat_id, thread_id, session_id)
     if prev_sid != session_id:
         await _do_resume_by_id(query, session_id)
-    # The enter-summary edits the chat's reusable info message: the panel edit
-    # is re-rendered in place right after, so a summary edited into the panel
-    # would vanish — and one NEW message per switch used to spam the chat.
-    await _send_session_info(chat_id, thread_id, session_id)
+    # The pinned panel is the canonical session summary surface. Avoid sending
+    # a second reusable info message into the chat after every session pick.
     await _pb_render(query, chat_id, thread_id)
 
 
