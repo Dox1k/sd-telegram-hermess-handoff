@@ -1925,140 +1925,6 @@ def _on_pre_llm_call(**kwargs) -> None:
         logger.warning("tg-projects: pre_llm_call failed", exc_info=True)
 
 
-# ------------------------------------------------------------- project sandbox
-# pre_tool_call: a session bound to a project cwd must not touch files OUTSIDE
-# it. The agent receives cwd as its working directory, but nothing in the core
-# enforces it — a model free to "continue the last task" once walked into
-# another project's tree (Ambrozia from a NeiroSlop chat). This hook is the
-# guard: path-carrying tools are checked against the CURRENT session's cwd
-# (state.db sessions.cwd, written by _apply_session_cwd); a target outside
-# the project root is BLOCKED with a message that names the sandbox.
-_SANDBOX_PATH_TOOLS = {
-    "read_file": ("path",),
-    "write_file": ("path",),
-    "patch": ("path",),
-    "search_files": ("path",),
-    "vision_analyze": ("image_url",),
-    "text_to_speech": ("output_path",),
-}
-_SANDBOX_ALWAYS_ALLOWED = {
-    # read-only / non-filesystem tools never touch the project tree
-    "web_search", "web_extract", "browser_exec", "browser_vault_list",
-    "clarify", "memory", "skill_view", "skills_list", "todo_list",
-    "delegate_task", "tool_search", "tool_describe", "tool_call",
-}
-
-
-def _sandbox_session_cwd(session_id: str) -> str:
-    """The session's recorded cwd (state.db), '' when unset/unreadable."""
-    sid = str(session_id or "").strip()
-    if not sid:
-        return ""
-    try:
-        conn = _open_state_db()
-        if conn is None:
-            return ""
-        try:
-            row = conn.execute("SELECT cwd FROM sessions WHERE id = ?", (sid,)).fetchone()
-        finally:
-            with _suppress(Exception):
-                conn.close()
-        return str(row["cwd"] or "").strip() if row is not None else ""
-    except Exception:
-        return ""
-
-
-def _path_outside_sandbox(raw_path: str, root: str) -> bool:
-    """True when *raw_path* (possibly relative) resolves outside *root*.
-
-    Relative paths resolve against the session cwd (= root) — they stay inside
-    unless they climb out with '..'. Non-path values (URLs, ':memory:', empty)
-    never block.
-    """
-    p = str(raw_path or "").strip()
-    if not p or p.startswith(("http://", "https://", "data:")) or p == ":memory:":
-        return False
-    try:
-        root_real = os.path.realpath(root)
-        target = os.path.realpath(os.path.join(root, p))
-        return os.path.commonpath([root_real, target]) != root_real
-    except Exception:
-        return False
-
-
-# Interpreter / shell-tool tokens are never DATA paths: `cd /proj && /usr/bin/python3
-# -m py_compile x.py` runs INSIDE root — the executable being absolute does not
-# let the command escape the sandbox. Blocking them broke legit project work
-# (py_compile after a patch, venv pythons). Keep the list tight: shells and
-# script interpreters only, and require the exact canonical path (no subdirs).
-_SANDBOX_SAFE_EXECUTABLES = frozenset({
-    "/usr/bin/python3", "/usr/bin/python2", "/usr/bin/python",
-    "/usr/bin/env", "/usr/bin/make", "/usr/bin/node",
-    "/bin/sh", "/bin/bash", "/bin/dash", "/usr/bin/bash",
-    "/usr/local/bin/python3", "/usr/local/bin/python",
-})
-
-
-def _sandbox_check_terminal(command: str, root: str) -> Optional[str]:
-    """Block message for a terminal command that leaves *root*, else None.
-
-    Extracts cd targets and absolute-path tokens heuristically; a command with
-    no path signal is allowed (the shell's cwd is the project root — a plain
-    `ls` cannot escape it).
-    """
-    cmd = str(command or "").strip()
-    if not cmd:
-        return None
-    for target in re.findall(r"(?:^|&&|;|\|)\s*cd\s+([^\s;&|]+)", cmd):
-        if _path_outside_sandbox(target, root):
-            return (f"⛔ Каталог вне проекта ({root}): cd {target}. "
-                    "Команда заблокирована песочницей проекта.")
-    for tok in re.findall(r"(?:^|[\s;&|(`=\[])(/[\w\-./'\"]+)", cmd):
-        tok = tok.strip().strip("\"'")
-        if not tok or tok in _SANDBOX_SAFE_EXECUTABLES:
-            continue
-        if _path_outside_sandbox(tok, root):
-            return (f"⛔ Путь вне проекта ({root}): {tok}. "
-                    "Команда заблокирована песочницей проекта.")
-    return None
-
-
-def _on_pre_tool_call(tool_name: str = "", args: Optional[Dict[str, Any]] = None,
-                      task_id: str = "", session_id: str = "",
-                      tool_call_id: str = "", **_: Any) -> Optional[Dict[str, Any]]:
-    """Project-sandbox gate for path-carrying tools; None/None = proceed.
-
-    Only sessions with a RECORDED project cwd (state.db sessions.cwd, set by
-    this plugin's binding flow) are sandboxed; CLI/desktop/global turns and
-    unbound chats are untouched. Fail-open on any internal error: a broken
-    guard must not brick the agent.
-    """
-    try:
-        if not tool_name or tool_name in _SANDBOX_ALWAYS_ALLOWED:
-            return None
-        root = _sandbox_session_cwd(session_id or task_id)
-        if not root or not os.path.isdir(root):
-            return None
-        if tool_name == "terminal":
-            block = _sandbox_check_terminal(str((args or {}).get("command") or ""), root)
-            if block:
-                logger.info("tg-projects: sandbox blocked terminal in %s", root)
-                return {"action": "block", "message": block}
-            return None
-        for key in _SANDBOX_PATH_TOOLS.get(tool_name, ()):
-            val = (args or {}).get(key)
-            if val and _path_outside_sandbox(str(val), root):
-                msg = (f"⛔ Путь вне проекта ({root}): {val}. "
-                       "Инструмент заблокирован песочницей проекта.")
-                logger.info("tg-projects: sandbox blocked %s(%s) in %s",
-                            tool_name, key, root)
-                return {"action": "block", "message": msg}
-        return None
-    except Exception:
-        logger.warning("tg-projects: sandbox pre_tool_call failed", exc_info=True)
-        return None
-
-
 # ----------------------------------------------------------------- keyboard builders
 # One project-list page: with 5+ projects the list paginates (tgp:pl:<offset>).
 _PROJECTS_PER_PAGE = 5
@@ -3641,7 +3507,13 @@ async def _pb_delete_confirm_screen(query, chat_id: str, thread_id: Optional[int
 
 async def _pb_delete_session(query, chat_id: str, thread_id: Optional[int],
                              session_id: str) -> None:
-    """A tgp:pb:delok:<id> tap: guarded permanent delete + binding cleanup."""
+    """A tgp:pb:delok:<id> tap: guarded permanent delete + binding cleanup.
+
+    Online sessions are no longer refused. We attempt the same runner
+    interrupt used by Stop, ignore interrupt errors, then call
+    SessionDB.delete_session with active write guards excluded. Binding
+    cleanup happens only after a successful delete.
+    """
     binding = _pb_binding(chat_id, thread_id)
     state_conn = _sessions_state_conn()
     try:
@@ -3654,7 +3526,6 @@ async def _pb_delete_session(query, chat_id: str, thread_id: Optional[int],
             parent = state_conn.execute(
                 "SELECT parent_session_id FROM sessions WHERE id = ?",
                 (session_id,)).fetchone()["parent_session_id"]
-        status = _pb_session_status(state_conn, session_id) if row is not None else ""
     finally:
         with _suppress(Exception):
             state_conn.close()
@@ -3671,13 +3542,24 @@ async def _pb_delete_session(query, chat_id: str, thread_id: Optional[int],
                 f"❌ Сессия {session_id} не найдена — обновите список: [⬅️ Назад].",
                 reply_markup=_pb_back_keyboard())
         return
-    if str(status or "").lower() == "online":
-        with _suppress(Exception):
-            await query.edit_message_text(
-                f"⛔ Сессия {_pb_short_session_id(session_id)} занята (идёт ход). "
-                "Дождись ответа или нажми [⏹ Stop], затем удаляй.",
-                reply_markup=_pb_back_keyboard())
-        return
+
+    if _ADAPTER is not None:
+        runner = getattr(_ADAPTER, "gateway_runner", None)
+        try:
+            stop_target = _pb_stop_target(chat_id, thread_id, runner)
+            if isinstance(stop_target, tuple):
+                try:
+                    await _interrupt_runner_turn(runner, stop_target)
+                except Exception as exc:
+                    logger.info("tg-projects: delete interrupt failed for %s: %s",
+                                session_id, exc, exc_info=True)
+            elif stop_target == "error":
+                logger.info("tg-projects: delete interrupt target lookup failed for %s",
+                            session_id)
+        except Exception as exc:
+            logger.info("tg-projects: delete interrupt lookup raised for %s: %s",
+                        session_id, exc, exc_info=True)
+
     deleted = False
     err = None
     try:
@@ -3797,20 +3679,128 @@ async def _pb_new_session(query, chat_id: str, thread_id: Optional[int]) -> None
     await _pb_render(query, chat_id, thread_id)
 
 
+def _panel_chat_id(query) -> str:
+    msg = getattr(query, "message", None)
+    chat = getattr(msg, "chat", None) if msg is not None else None
+    return str(getattr(chat, "id", "") or "")
+
+
+def _panel_thread_id(query) -> Optional[int]:
+    msg = getattr(query, "message", None)
+    return _norm_thread_id(getattr(msg, "message_thread_id", None)) if msg is not None else None
+
+
+def _pb_stop_target(chat_id: str, thread_id: Optional[int], runner: Any,
+                    state_conn=None) -> Any:
+    """Resolve a panel Stop to the runner session_key, or a refusal string.
+
+    Returns ``(session_key, source)`` only when the authenticated topic binding
+    has a session id and the runner's session store can map that id to a runner
+    routing entry. Any missing/ambiguous mapping returns ``"error"``; no
+    binding returns ``"none"``.
+    """
+    binding = _pb_binding(chat_id, thread_id)
+    session_id = str((binding or {}).get("session_id") or "").strip()
+    if not session_id:
+        return "none"
+    store = getattr(runner, "session_store", None) if runner is not None else None
+    entry = None
+    if store is not None and hasattr(store, "lookup_by_session_id"):
+        with _suppress(Exception):
+            entry = store.lookup_by_session_id(session_id)
+    if entry is None:
+        # AsyncSessionStore offloads sync store methods through __getattr__.
+        store_async = getattr(runner, "async_session_store", None) if runner is not None else None
+        if store_async is not None and hasattr(store_async, "lookup_by_session_id"):
+            with _suppress(Exception):
+                entry = store_async.lookup_by_session_id(session_id)
+            import inspect
+            if inspect.iscoroutine(entry):
+                # Never block a callback awaiting: fail closed instead of
+                # spawning an extra thread from button code.
+                entry.close()
+                return "error"
+    if entry is None or not getattr(entry, "session_key", ""):
+        return "error"
+    # Guard against a runner index entry that does not name the bound session
+    # id; that means the session-key mapping is stale or cross-profile.
+    if getattr(entry, "session_id", "") != session_id:
+        return "error"
+    return (str(entry.session_key), getattr(entry, "origin", None) or
+            _make_telegram_source_for_stop(runner))
+
+
+def _make_telegram_source_for_stop(runner: Any):
+    """Fallback source for _interrupt_and_clear_session when entry.origin is gone.
+
+    Only used as the runner's internal bookkeeping source; the actual
+    authorization already came from the plugin's callback gate. Never invents
+    a session mapping.
+    """
+    try:
+        from gateway.session import SessionSource
+        from gateway.platforms.base import Platform
+        return SessionSource(platform=Platform.TELEGRAM, chat_type="dm", chat_id="")
+    except Exception:
+        return types.SimpleNamespace(platform=types.SimpleNamespace(value="telegram"),
+                                     chat_type="dm")
+
+
+async def _interrupt_runner_turn(runner: Any, target: tuple) -> None:
+    """Interrupt the runner's live turn for ``target``'s session key.
+
+    Uses the same public core entry point as /stop//new: it invalidates the
+    run generation, hard-interrupts the agent, reaps tool processes, clears
+    queued state, and invokes adapter/platform hooks.
+    """
+    if runner is None:
+        return
+    fn = getattr(runner, "_interrupt_and_clear_session", None)
+    if not callable(fn):
+        return
+    session_key, source = target
+    source = source if source is not None else _make_telegram_source_for_stop(runner)
+    await fn(session_key, source, interrupt_reason="stop_command_panel",
+             invalidation_reason="stop_command_panel")
+
+
 async def _pb_stop(query) -> None:
-    """[⏹ Stop]: /stop is a real gateway command (interrupt_then_dispatch), so a
-    synthetic event stops the running turn of this chat's session in both idle
-    and busy states."""
+    """[⏹ Stop]: interrupt the bound session's live turn from the runner.
+
+    A synthetic ``/stop`` is scoped to the tapping Telegram session and cannot
+    cancel a desktop-origin turn. The runner does: resolve ONLY the
+    authenticated topic binding's ``session_id``, resolve that id to the
+    runner's session key, then call the core ``_interrupt_and_clear_session``
+    path. There is no lease check — an idle session's interrupt is a no-op in
+    the core, so Stop never refuses a bound session. Fail closed only when the
+    mapping is missing/ambiguous.
+    """
     if _ADAPTER is None:
         with _suppress(Exception):
             await query.edit_message_text("⏹ Остановка недоступна (адаптер не подключён).",
                                           reply_markup=_pb_back_keyboard())
         return
+    chat_id = _panel_chat_id(query)
+    thread_id = _panel_thread_id(query)
+    runner = getattr(_ADAPTER, "gateway_runner", None)
+    target = _pb_stop_target(chat_id, thread_id, runner)
+    if target == "error":
+        with _suppress(Exception):
+            await query.edit_message_text(
+                "⛔ Не удалось безопасно остановить сессию (маппинг сессии "
+                "пропущен или неоднозначен).",
+                reply_markup=_pb_back_keyboard())
+        return
+    if target == "none":
+        with _suppress(Exception):
+            await query.edit_message_text(
+                "⛔ Сессия не привязана к топикам.",
+                reply_markup=_pb_back_keyboard())
+        return
+    await _interrupt_runner_turn(runner, target)
     with _suppress(Exception):
-        await query.edit_message_text(
-            "⏹ Останавливаю текущую сессию (/stop) — ответ придёт ниже.",
-            reply_markup=_pb_back_keyboard())
-    await _send_gateway_command(query, "/stop")
+        await query.edit_message_text("⏹ Останавливаю текущую сессию.",
+                                      reply_markup=_pb_back_keyboard())
 
 
 async def _pb_model_screen(query) -> None:
@@ -4729,7 +4719,7 @@ async def _wizard_hook_impl(event: Any) -> Optional[Dict[str, Any]]:
 
     if step == "path":
         name = str(entry.get("name") or "").strip()
-        path = text.strip().strip('"')
+        path = text.strip().strip('"\'').strip('()[]').strip()
         err = _wizard_validate_name(name)
         if err is None:
             err = _wizard_path_error(name, path, create_dir=True)
@@ -4783,14 +4773,6 @@ def register(ctx) -> None:
     # session without a pin, /resume'd sessions): applies the topic->project
     # cwd on the first turn instead. Idempotent via _CWD_APPLIED.
     ctx.register_hook("pre_llm_call", _on_pre_llm_call)
-    # Project sandbox: pre_tool_call blocks path-carrying tools/terminal
-    # commands that leave the session's project cwd (state.db sessions.cwd).
-    try:
-        ctx.register_hook("pre_tool_call", _on_pre_tool_call)
-        logger.info("tg-projects: sandbox pre_tool_call hook registered")
-    except Exception:
-        logger.warning("tg-projects: sandbox hook registration failed",
-                       exc_info=True)
     # Lazy prune of stale topic bindings/panels at start; never fatal.
     try:
         _prune_stale_state()

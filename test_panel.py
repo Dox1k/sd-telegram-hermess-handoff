@@ -23,7 +23,7 @@ import tempfile
 import time
 import types
 import unittest
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from pathlib import Path
 
 PLUGIN_DIR = Path(os.environ.get("TGP_PLUGIN_DIR")
@@ -57,7 +57,7 @@ class _Project:
 
 
 PROJECTS = [
-    _Project("p1", "NeiroSlop", "neiroslop", "/mnt/mydisk/comfyanonymous)"),
+    _Project("p1", "NeiroSlop", "neiroslop", "/mnt/mydisk/comfyanonymous"),
     _Project("p2", "Ambrozia", "ambrozia", str(PLUGIN_DIR)),
 ]
 
@@ -142,10 +142,13 @@ class _FakeStateDB:
         lease = _FAKE_STATE.conn.execute(
             "SELECT 1 FROM session_turn_leases WHERE conversation_id = ? AND expires_at > ?",
             (session_id, time.time())).fetchone()
-        if lease and exclude_active_write_guards:
+        if lease and not exclude_active_write_guards:
             raise SessionActiveWriteGuardError("active turn lease")
         _FAKE_STATE.conn.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
         _FAKE_STATE.conn.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
+        if lease:
+            _FAKE_STATE.conn.execute(
+                "DELETE FROM session_turn_leases WHERE conversation_id = ?", (session_id,))
         _FAKE_STATE.conn.commit()
         _FakeStateDB.last_deleted = (session_id, exclude_active_write_guards)
         return True
@@ -330,7 +333,7 @@ CHAT = "7559860199"
 THREAD = 65008
 KEY = f"{CHAT}:{THREAD}"
 SID = "20261003_062445_2d0fd7"
-CWD = "/mnt/mydisk/comfyanonymous)"
+CWD = "/mnt/mydisk/comfyanonymous"
 
 
 def _binding_entry(session_id=None):
@@ -421,7 +424,7 @@ def _run(coro):
 def _seed_session(sid, source="telegram", cwd=CWD, started=1791300000.0,
                   count=12, chat=CHAT, thread=str(THREAD), lease_until=None,
                   ended=None, last_active=None, model="", in_tok=0, out_tok=0,
-                  parent_id=None):
+                  parent_id=None, session_key=None, lease_holder="pid=42:turn=d"):
     conn = _FAKE_STATE.conn
     conn.execute(
         "INSERT INTO sessions (id, source, cwd, started_at, message_count,"
@@ -431,12 +434,13 @@ def _seed_session(sid, source="telegram", cwd=CWD, started=1791300000.0,
         (sid, source, cwd, started, count, "", chat, thread, ended,
          last_active if last_active is not None else
          (time.time() if ended is None else (ended or started)),
-         model, in_tok, out_tok, f"agent:main:telegram:dm:{chat}", parent_id))
+         model, in_tok, out_tok,
+         session_key or f"agent:main:telegram:dm:{chat}", parent_id))
     if lease_until is not None:
         conn.execute(
             "INSERT INTO session_turn_leases (conversation_id, holder,"
              " acquired_at, expires_at) VALUES (?,?,?,?)",
-            (sid, "pid=42:turn=d", time.time(), lease_until))
+            (sid, lease_holder, time.time(), lease_until))
     conn.commit()
 
 
@@ -727,15 +731,24 @@ class SessionDeleteFlowTests(_StubbedTestCase):
         self.assertIsNone(_STATE_DATA["topic_bindings"][KEY]["session_id"])
         self.assertIn("удалена", query.edits[-1][0])
 
-    def test_delete_confirm_refuses_active_session_and_keeps_binding(self):
-        _STATE_DATA["topic_bindings"] = {KEY: _binding_entry(SID)}
-        _seed_session(SID, lease_until=time.time() + 300)
-        query = self._tap(f"tgp:pb:delok:{SID}")
-        self.assertIn("занята", query.edits[-1][0])
-        self.assertIsNotNone(_FAKE_STATE.conn.execute(
-            "SELECT 1 FROM sessions WHERE id = ?", (SID,)).fetchone())
-        self.assertEqual(_STATE_DATA["topic_bindings"][KEY]["session_id"], SID)
-        self.assertEqual(_FakeStateDB.last_deleted, None)
+    def test_delete_confirm_deletes_active_session_after_interrupt(self):
+        sid = "20261009_000000_desktop1"
+        desktop_key = "agent:main:desktop:dm:desktop-1"
+        _STATE_DATA["topic_bindings"] = {KEY: _binding_entry(sid)}
+        _seed_session(sid, source="desktop", chat="desktop-1", session_key=desktop_key,
+                      lease_until=time.time() + 300,
+                      lease_holder="pid=42:platform=desktop")
+        runner = _FakeRunner(session_key=desktop_key, session_id=sid)
+        self.adapter.gateway_runner = runner
+        query = self._tap(f"tgp:pb:delok:{sid}")
+        self.assertEqual(runner._interrupts[0][0], desktop_key)
+        self.assertEqual(_FakeStateDB.last_deleted, (sid, True))
+        self.assertIsNone(_FAKE_STATE.conn.execute(
+            "SELECT 1 FROM sessions WHERE id = ?", (sid,)).fetchone())
+        self.assertIsNone(_FAKE_STATE.conn.execute(
+            "SELECT 1 FROM session_turn_leases WHERE conversation_id = ?", (sid,)).fetchone())
+        self.assertIsNone(_STATE_DATA["topic_bindings"][KEY]["session_id"])
+        self.assertIn("удалена", query.edits[-1][0])
 
     def test_delete_confirm_unknown_session_shows_error(self):
         _STATE_DATA["topic_bindings"] = {KEY: _binding_entry(None)}
@@ -1042,12 +1055,125 @@ class PanelCallbackTests(_StubbedTestCase):
         self.assertEqual(query.edits[-1][0], f"📁  NeiroSlop  {CWD}\n🧵  —\n🤖  —")
         self.assertIsNotNone(query.edits[-1][1])
 
-    def test_stop_sends_stop_command(self):
-        _STATE_DATA["topic_bindings"] = {KEY: _binding_entry(SID)}
+class _FakeSessionEntry:
+    def __init__(self, session_key, session_id):
+        self.session_key = session_key
+        self.session_id = session_id
+
+
+class _FakeRunner:
+    def __init__(self, session_key=None, session_id=None):
+        self._interrupts = []
+        self._entries = {}
+        if session_key is not None:
+            self._entries[session_id] = _FakeSessionEntry(session_key, session_id)
+
+    class _FakeSessionStore:
+        def __init__(self, outer):
+            self.outer = outer
+
+        def lookup_by_session_id(self, session_id):
+            return self.outer._entries.get(session_id)
+
+    def __getattr__(self, name):
+        if name == "session_store":
+            return self._FakeSessionStore(self)
+        raise AttributeError(name)
+
+    async def _interrupt_and_clear_session(self, session_key, source, *,
+                                           interrupt_reason, invalidation_reason):
+        self._interrupts.append((session_key, source, interrupt_reason,
+                                 invalidation_reason))
+
+
+
+@unittest.skipUnless(_HAS_PANEL, "deploy copy has no panel code yet")
+class PanelStopCrossSourceTests(_StubbedTestCase):
+    """[⏹ Stop] must cancel a bound cross-source turn, fail closed otherwise."""
+
+    def setUp(self):
+        super().setUp()
+        _reset_state()
+        _reset_fake_db()
+        self.adapter = FakeAdapter()
+        mod._ADAPTER = self.adapter
+        self.bot = FakeBot()
+        mod._NATIVE = types.SimpleNamespace(bot=self.bot)
+        self.addCleanup(self._restore)
+
+    def _restore(self):
+        mod._ADAPTER = None
+        mod._NATIVE = None
+
+    def _tap(self, data, chat=CHAT, thread=THREAD):
+        query = FakeQuery(data, chat_id=int(chat), thread_id=thread)
+        update = types.SimpleNamespace(callback_query=query)
+        _run(mod._tg_on_button(update, None))
+        return query
+
+    def test_bound_desktop_session_without_lease_is_interrupted(self):
+        sid = "20261009_000000_desktop1"
+        desktop_key = "agent:main:desktop:dm:desktop-1"
+        _STATE_DATA["topic_bindings"] = {KEY: _binding_entry(sid)}
+        _seed_session(sid, source="desktop", chat="desktop-1", session_key=desktop_key,
+                      lease_until=time.time() + 300,
+                      lease_holder="pid=42:platform=desktop")
+        runner = _FakeRunner(session_key=desktop_key, session_id=sid)
+        self.adapter.gateway_runner = runner
         query = self._tap("tgp:pb:stop")
+        self.assertEqual(runner._interrupts[0][0], desktop_key)
+        self.assertEqual(runner._interrupts[0][2], "stop_command_panel")
         self.assertIn("Останавливаю", query.edits[0][0])
-        self.assertTrue(any(getattr(e, "text", "") == "/stop"
-                            for e in self.adapter.events))
+        self.assertEqual(self.adapter.events, [])
+
+    def test_bound_desktop_session_without_live_lease_is_still_interrupted(self):
+        sid = "20261009_000000_idle"
+        desktop_key = "agent:main:desktop:dm:desktop-idle"
+        _STATE_DATA["topic_bindings"] = {KEY: _binding_entry(sid)}
+        _seed_session(sid, source="desktop", chat="desktop-idle",
+                      session_key=desktop_key)
+        runner = _FakeRunner(session_key=desktop_key, session_id=sid)
+        self.adapter.gateway_runner = runner
+        query = self._tap("tgp:pb:stop")
+        self.assertEqual(runner._interrupts[0][0], desktop_key)
+        self.assertEqual(runner._interrupts[0][2], "stop_command_panel")
+        self.assertIn("Останавливаю", query.edits[0][0])
+        self.assertEqual(self.adapter.events, [])
+
+    def test_missing_or_ambiguous_session_key_refuses_without_runner_call(self):
+        sid = "20261009_000000_ambiguous"
+        _STATE_DATA["topic_bindings"] = {KEY: _binding_entry(sid)}
+        _seed_session(sid, source="desktop", chat="desktop-amb",
+                      session_key="agent:main:desktop:dm:desktop-amb",
+                      lease_until=time.time() + 300,
+                      lease_holder="pid=42:platform=desktop")
+        runner = _FakeRunner()  # no session_id -> session_key mapping
+        self.adapter.gateway_runner = runner
+        query = self._tap("tgp:pb:stop")
+        self.assertIn("неоднозначен", query.edits[0][0])
+        self.assertEqual(runner._interrupts, [])
+
+    def test_no_bound_session_refuses_without_runner_call(self):
+        runner = _FakeRunner(session_key="agent:main:desktop:dm:desktop-x",
+                             session_id="20261009_000000_wrong")
+        self.adapter.gateway_runner = runner
+        query = self._tap("tgp:pb:stop")
+        self.assertIn("не привязана", query.edits[0][0])
+        self.assertEqual(runner._interrupts, [])
+
+    def test_telegram_origin_existing_behavior_remains_correct(self):
+        sid = "20261009_000000_telegram"
+        telegram_key = "agent:main:telegram:dm:7559860199"
+        _STATE_DATA["topic_bindings"] = {KEY: _binding_entry(sid)}
+        _seed_session(sid, source="telegram", chat=CHAT, session_key=telegram_key,
+                      lease_until=time.time() + 300)
+        runner = _FakeRunner(session_key=telegram_key, session_id=sid)
+        self.adapter.gateway_runner = runner
+        query = self._tap("tgp:pb:stop")
+        self.assertEqual(runner._interrupts[0][0], telegram_key)
+        self.assertEqual(runner._interrupts[0][2], "stop_command_panel")
+        self.assertIn("Останавливаю", query.edits[0][0])
+        self.assertEqual(self.adapter.events, [])
 
     def test_stop_without_adapter_shows_note(self):
         mod._ADAPTER = None

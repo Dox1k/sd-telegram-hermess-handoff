@@ -382,6 +382,15 @@ class DialogFlowTests(_WizardTest):
         self.assertEqual(result, {"action": "skip", "reason": "project_wizard"})
         self.assertEqual(CREATE_CALLS[0]["primary_path"], self.tmp.name)
 
+    def test_path_answer_strips_trailing_parenthesis(self):
+        # A path with a stray closing paren (typo / copy-paste artifact) is
+        # cleaned by the strip('()[]') pass before validation.
+        self._to_path_step("SD2")
+        result = _dispatch(f"{self.tmp.name})")
+        self.assertEqual(result, {"action": "skip", "reason": "project_wizard"})
+        self.assertEqual(CREATE_CALLS[0]["primary_path"], self.tmp.name)
+        self.assertTrue(os.path.isdir(self.tmp.name))
+
     def test_cyrillic_name_transliterated_in_slug(self):
         self._to_path_step("Проект Тест")
         _dispatch(self.tmp.name)

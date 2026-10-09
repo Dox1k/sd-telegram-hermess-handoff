@@ -1,2 +1,3 @@
 __pycache__/
 state.json
+.pytest_cache/
