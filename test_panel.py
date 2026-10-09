@@ -15,6 +15,7 @@ full pytest run stays green until the integrated __init__.py is deployed.
 """
 import asyncio
 import importlib.util
+import json
 import os
 import sqlite3
 import sys
@@ -25,13 +26,16 @@ import unittest
 from contextlib import contextmanager
 from pathlib import Path
 
-PLUGIN_DIR = Path(os.environ.get("TGP_PLUGIN_DIR",
-                                 "/home/meow/.hermes/plugins/tg-projects"))
+PLUGIN_DIR = Path(os.environ.get("TGP_PLUGIN_DIR")
+                  or Path(__file__).resolve().parent)
 
 
 # ----------------------------------------------------------------- core stubs
 fake_yaml = types.ModuleType("yaml")
-fake_yaml.safe_load = staticmethod(lambda text: {})
+fake_yaml._config = {}
+def _fake_safe_load(text):
+    return dict(fake_yaml._config)
+fake_yaml.safe_load = staticmethod(_fake_safe_load)
 
 fake_terminal = types.ModuleType("tools.terminal_tool")
 fake_terminal._calls = []
@@ -127,12 +131,36 @@ class _FakeStateDB:
         _FAKE_STATE.conn.commit()
         return 1
 
+    def delete_session(self, session_id, sessions_dir=None,
+                       exclude_active_write_guards=False, **kw):
+        if _FakeStateDB.last_error is not None:
+            raise _FakeStateDB.last_error
+        row = _FAKE_STATE.conn.execute(
+            "SELECT 1 FROM sessions WHERE id = ?", (session_id,)).fetchone()
+        if row is None:
+            return False
+        lease = _FAKE_STATE.conn.execute(
+            "SELECT 1 FROM session_turn_leases WHERE conversation_id = ? AND expires_at > ?",
+            (session_id, time.time())).fetchone()
+        if lease and exclude_active_write_guards:
+            raise SessionActiveWriteGuardError("active turn lease")
+        _FAKE_STATE.conn.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
+        _FAKE_STATE.conn.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
+        _FAKE_STATE.conn.commit()
+        _FakeStateDB.last_deleted = (session_id, exclude_active_write_guards)
+        return True
+
     def close(self):
         self.closed = True
 
 
+class SessionActiveWriteGuardError(RuntimeError):
+    pass
+
+
 fake_hermes_state = types.ModuleType("hermes_state")
 fake_hermes_state.SessionDB = _FakeStateDB
+fake_hermes_state.SessionActiveWriteGuardError = SessionActiveWriteGuardError
 
 _MODULES = {
     "yaml": fake_yaml,
@@ -190,9 +218,12 @@ class _FakeStateDBSchema:
         self.conn.execute(
             "CREATE TABLE sessions (id TEXT PRIMARY KEY, source TEXT, cwd TEXT,"
             " started_at REAL, message_count INTEGER, title TEXT, chat_id TEXT,"
-            " thread_id TEXT, ended_at REAL, model TEXT,"
+            " thread_id TEXT, ended_at REAL, model TEXT, session_key TEXT,"
+            " parent_session_id TEXT,"
             " input_tokens INTEGER DEFAULT 0, output_tokens INTEGER DEFAULT 0,"
             " last_activity_at REAL)")
+        self.conn.execute(
+            "CREATE TABLE gateway_routing (session_key TEXT, entry_json TEXT, updated_at REAL)")
         self.conn.execute(
             "CREATE TABLE messages (session_id TEXT, role TEXT, content TEXT)")
         self.conn.execute(
@@ -271,6 +302,7 @@ def _reset_fake_db():
     conn.execute("DELETE FROM messages")
     conn.execute("DELETE FROM sessions")
     conn.execute("DELETE FROM session_turn_leases")
+    conn.execute("DELETE FROM gateway_routing")
     conn.commit()
     _FakeSessionDB_instances_reset()
 
@@ -278,6 +310,7 @@ def _reset_fake_db():
 def _FakeSessionDB_instances_reset():
     _FakeStateDB.instances.clear()
     _FakeStateDB.last_error = None
+    _FakeStateDB.last_deleted = None
 
 
 def _reset_state():
@@ -387,14 +420,18 @@ def _run(coro):
 
 def _seed_session(sid, source="telegram", cwd=CWD, started=1791300000.0,
                   count=12, chat=CHAT, thread=str(THREAD), lease_until=None,
-                  ended=None, last_active=None):
+                  ended=None, last_active=None, model="", in_tok=0, out_tok=0,
+                  parent_id=None):
     conn = _FAKE_STATE.conn
     conn.execute(
         "INSERT INTO sessions (id, source, cwd, started_at, message_count,"
-        " title, chat_id, thread_id, ended_at, last_activity_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
+        " title, chat_id, thread_id, ended_at, last_activity_at,"
+        " model, input_tokens, output_tokens, session_key, parent_session_id)"
+        " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (sid, source, cwd, started, count, "", chat, thread, ended,
          last_active if last_active is not None else
-         (time.time() if ended is None else (ended or started))))
+         (time.time() if ended is None else (ended or started)),
+         model, in_tok, out_tok, f"agent:main:telegram:dm:{chat}", parent_id))
     if lease_until is not None:
         conn.execute(
             "INSERT INTO session_turn_leases (conversation_id, holder,"
@@ -435,10 +472,40 @@ class PanelStateTests(_StubbedTestCase):
 
 
 @unittest.skipUnless(_HAS_PANEL, "deploy copy has no panel code yet")
+class PcMirrorSuppressionTests(_StubbedTestCase):
+    """The TG-side suppression window: the per-tick lease refresh keeps it
+    alive for the WHOLE turn (a 3-min streamed turn once outlived the 60s
+    pre_llm_call grace and the final flush was mirrored twice, 2026-10-09)."""
+
+    def test_lease_refresh_extends_window_beyond_pre_llm_grace(self):
+        mod._PC_MIRROR_TG_UNTIL.clear()
+        # pre_llm mark set at turn start: 60s grace
+        mod._PC_MIRROR_TG_UNTIL["s1"] = time.time() - 1.0  # already stale
+        orig = mod._pc_mirror_lease_tg_until
+        lease_until = time.time() + 180.0 + mod._PC_MIRROR_TG_GRACE_S
+        try:
+            mod._pc_mirror_lease_tg_until = lambda sid: lease_until
+            # the per-tick refresh (the loop's new block, inlined here):
+            until = mod._pc_mirror_lease_tg_until("s1")
+            if until is not None and until > mod._PC_MIRROR_TG_UNTIL.get("s1", 0.0):
+                mod._PC_MIRROR_TG_UNTIL["s1"] = until
+            # the window now covers a 3-minute streamed turn
+            self.assertGreater(mod._PC_MIRROR_TG_UNTIL["s1"], time.time() + 180.0)
+        finally:
+            mod._pc_mirror_lease_tg_until = orig
+            mod._PC_MIRROR_TG_UNTIL.clear()
+
+    def test_stale_grace_without_lease_does_not_suppress(self):
+        mod._PC_MIRROR_TG_UNTIL.clear()
+        mod._PC_MIRROR_TG_UNTIL["s1"] = time.time() - 1.0
+        self.assertLess(mod._PC_MIRROR_TG_UNTIL["s1"], time.time())
+        mod._PC_MIRROR_TG_UNTIL.clear()
+
+
+@unittest.skipUnless(_HAS_PANEL, "deploy copy has no panel code yet")
 class SessionsRecencyTests(_StubbedTestCase):
     """Live sessions plus recently-active ended ones (a /new reset must not
     hide today's sessions); anything a day old is history."""
-
     def setUp(self):
         super().setUp()
         _reset_state()
@@ -470,18 +537,95 @@ class PanelTextTests(_StubbedTestCase):
 
     def test_render_no_binding(self):
         text = mod._pb_panel_text(None)
-        self.assertEqual(text, "📁  —\n🧵  —\n📂  —\n\nСначала выбери проект: [📁 Проект]")
+        self.assertEqual(text, "📁  —  —\n🧵  —\n🤖  —\n\nСначала выбери проект: [📁 Проект]")
 
     def test_render_binding_without_session(self):
         text = mod._pb_panel_text(_binding_entry(None))
-        self.assertEqual(text, f"📁  NeiroSlop\n🧵  —\n📂  {CWD}")
+        self.assertEqual(text, f"📁  NeiroSlop  {CWD}\n🧵  —\n🤖  —")
+
+    def test_render_chat_mode_binding(self):
+        # the "no project" chat mode: empty fields, not the literal "None"
+        text = mod._pb_panel_text({"project_id": "", "project_name": "", "cwd": "",
+                                   "session_id": None, "updated_at": 1791300571})
+        self.assertEqual(text, "💬  Разговорник (без проекта)\n🧵  —\n🤖  —")
+
+    def test_render_chat_mode_shows_global_model(self):
+        import tempfile
+        fake_yaml._config.clear()
+        fake_yaml._config["model"] = {"default": "deepseek-v4.1-flash"}
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                (Path(tmp) / "config.yaml").write_text("model: stub\n", encoding="utf-8")
+                with _with_env(HERMES_HOME=tmp):
+                    text = mod._pb_panel_text({"project_id": "", "project_name": "",
+                                               "cwd": "", "session_id": None,
+                                               "updated_at": 1791300571})
+        finally:
+            fake_yaml._config.clear()
+        self.assertEqual(text, "💬  Разговорник (без проекта)\n🧵  —\n🤖  deepseek-v4.1-flash")
+
+    def test_write_binding_none_fields_stay_empty(self):
+        self.assertTrue(mod._pb_write_binding(CHAT, THREAD, None, None, None, None))
+        entry = _STATE_DATA["topic_bindings"][f"{CHAT}:{THREAD}"]
+        self.assertEqual(entry["project_name"], "")
+        self.assertEqual(entry["cwd"], "")
+        self.assertEqual(entry["project_id"], "")
+        text = mod._pb_panel_text(dict(entry))
+        self.assertEqual(text, "💬  Разговорник (без проекта)\n🧵  —\n🤖  —")
+
+    def test_estimate_context_tokens_from_history(self):
+        kw = {"conversation_history": [
+            {"role": "system", "content": "x" * 400},
+            {"role": "user", "content": "y" * 400},
+            {"role": "assistant", "content": None},
+            {"role": "user", "content": [{"type": "text", "text": "z" * 400}]},
+        ]}
+        self.assertEqual(mod._estimate_context_tokens(kw), 300)
+
+    def test_pre_llm_call_caches_context_estimate(self):
+        mod._CTX_CACHE.clear()
+        mod._on_pre_llm_call(session_id="sess-ctx",
+                             conversation_history=[{"role": "user", "content": "a" * 800}])
+        self.assertEqual(mod._CTX_CACHE.get("sess-ctx")[0], 200)
+
+    def test_latest_prompt_tokens_prefers_live_cache_over_routing(self):
+        _STATE_DATA["topic_bindings"] = {KEY: _binding_entry(SID)}
+        _seed_session(SID)
+        _FAKE_STATE.conn.execute(
+            "INSERT INTO gateway_routing VALUES (?, ?, ?)",
+            (f"agent:main:telegram:dm:{CHAT}", json.dumps({"session_id": SID,
+             "last_prompt_tokens": 7}), time.time()))
+        mod._CTX_CACHE.clear()
+        mod._CTX_CACHE[SID] = (14336, time.time())
+        try:
+            self.assertEqual(mod._pb_latest_prompt_tokens(SID), 14336)
+        finally:
+            mod._CTX_CACHE.clear()
+
+    def test_latest_prompt_tokens_stale_cache_falls_back_to_routing(self):
+        _seed_session(SID)
+        _FAKE_STATE.conn.execute(
+            "INSERT INTO gateway_routing VALUES (?, ?, ?)",
+            (f"agent:main:telegram:dm:{CHAT}", json.dumps({"session_id": SID,
+             "last_prompt_tokens": 111578}), time.time()))
+        mod._CTX_CACHE.clear()
+        mod._CTX_CACHE[SID] = (14336, time.time() - 7 * 3600)  # older than 6h
+        try:
+            self.assertEqual(mod._pb_latest_prompt_tokens(SID), 111578)
+        finally:
+            mod._CTX_CACHE.clear()
 
     def test_render_binding_with_session_online(self):
-        _seed_session(SID, lease_until=time.time() + 300)
+        _seed_session(SID, lease_until=time.time() + 300, model="glm-5.3-flash", count=12)
+        _FAKE_STATE.conn.execute(
+            "INSERT INTO gateway_routing VALUES (?, ?, ?)",
+            (f"agent:main:telegram:dm:{CHAT}", json.dumps({"session_id": SID,
+             "last_prompt_tokens": 92000}), time.time()))
         status = mod._pb_session_status(_FAKE_STATE.conn, SID)
         self.assertEqual(status, "online")
         text = mod._pb_panel_text(_binding_entry(SID), status)
-        self.assertEqual(text, f"📁  NeiroSlop\n🧵  20261003_062… · 12 msg · online\n📂  {CWD}")
+        self.assertEqual(text,
+                         f"📁  NeiroSlop  {CWD}\n🧵  20261003_062… · контекст 92K · 12 msg · online\n🤖  glm-5.3-flash")
 
     def test_render_binding_with_session_idle(self):
         _seed_session(SID)  # no lease -> idle
@@ -494,7 +638,6 @@ class PanelTextTests(_StubbedTestCase):
                       count=5)
         _seed_session("20261004_101500_subagent", source="subagent", started=time.time(),
                       count=9)
-        _FAKE_STATE.conn.execute("ALTER TABLE sessions ADD COLUMN parent_session_id TEXT")
         _FAKE_STATE.conn.execute(
             "UPDATE sessions SET parent_session_id = ? WHERE id = ?", (SID, "20261004_101500_subagent"))
         _FAKE_STATE.conn.commit()
@@ -513,6 +656,113 @@ class PanelTextTests(_StubbedTestCase):
     def test_sessions_subscreen_without_sessions(self):
         text = mod._pb_sessions_text(_binding_entry(None), [])
         self.assertIn("(нет сессий в этом каталоге)", text)
+
+
+@unittest.skipUnless(_HAS_PANEL, "deploy copy has no panel code yet")
+class SessionDeleteFlowTests(_StubbedTestCase):
+    def setUp(self):
+        super().setUp()
+        _reset_state()
+        _reset_fake_db()
+        self.adapter = FakeAdapter()
+        mod._ADAPTER = self.adapter
+        self.bot = FakeBot()
+        mod._NATIVE = types.SimpleNamespace(bot=self.bot)
+        self.addCleanup(self._restore)
+
+    def _restore(self):
+        mod._ADAPTER = None
+        mod._NATIVE = None
+
+    def _tap(self, data, chat=CHAT, thread=THREAD):
+        query = FakeQuery(data, chat_id=int(chat), thread_id=thread)
+        update = types.SimpleNamespace(callback_query=query)
+        _run(mod._tg_on_button(update, None))
+        return query
+
+    def test_sessions_screen_has_no_delete_buttons(self):
+        _STATE_DATA["topic_bindings"] = {KEY: _binding_entry(SID)}
+        _seed_session(SID, lease_until=time.time() + 300)
+        other = "20261002_101500_0d0fd7"
+        _seed_session(other, source="desktop", count=5)
+        query = self._tap("tgp:pb:sess")
+        datas = [b.callback_data for row in query.edits[0][1].rows for b in row]
+        self.assertNotIn("tgp:pb:del:", "".join(datas))
+
+    def test_delete_screen_shows_inline_confirmation(self):
+        _STATE_DATA["topic_bindings"] = {KEY: _binding_entry(None)}
+        _seed_session("20261002_101500_0d0fd7", source="desktop", count=5)
+        query = self._tap("tgp:pb:del:20261002_101500_0d0fd7")
+        text, kb = query.edits[0]
+        datas = [b.callback_data for row in kb.rows for b in row]
+        self.assertIn("tgp:pb:delok:20261002_101500_0d0fd7", datas)
+        self.assertIn("tgp:pb:back", datas)
+        self.assertEqual(_FakeStateDB.last_deleted, None)
+
+    def test_current_session_delete_confirm_deletes_idle_session(self):
+        _STATE_DATA["topic_bindings"] = {KEY: _binding_entry(SID)}
+        _seed_session(SID)
+        query = self._tap(f"tgp:pb:delok:{SID}")
+        self.assertEqual(_FakeStateDB.last_deleted, (SID, True))
+        self.assertIsNone(_FAKE_STATE.conn.execute("SELECT 1 FROM sessions WHERE id = ?", (SID,)).fetchone())
+        self.assertIsNone(_STATE_DATA["topic_bindings"][KEY]["session_id"])
+        self.assertIn("удалена", query.edits[-1][0])
+
+    def test_delete_confirm_deletes_idle_session_clears_binding_and_rerenders(self):
+        _STATE_DATA["topic_bindings"] = {KEY: _binding_entry("20261002_101500_0d0fd7")}
+        _seed_session("20261002_101500_0d0fd7", source="desktop", count=5)
+        _FAKE_STATE.conn.execute(
+            "INSERT INTO messages (session_id, role, content) VALUES (?,?,?)",
+            ("20261002_101500_0d0fd7", "user", "старое"))
+        _FAKE_STATE.conn.commit()
+        query = self._tap("tgp:pb:delok:20261002_101500_0d0fd7")
+        self.assertEqual(_FakeStateDB.last_deleted,
+                         ("20261002_101500_0d0fd7", True))
+        self.assertIsNone(_FAKE_STATE.conn.execute(
+            "SELECT 1 FROM sessions WHERE id = ?",
+            ("20261002_101500_0d0fd7",)).fetchone())
+        self.assertIsNone(_FAKE_STATE.conn.execute(
+            "SELECT 1 FROM messages WHERE session_id = ?",
+            ("20261002_101500_0d0fd7",)).fetchone())
+        self.assertIsNone(_STATE_DATA["topic_bindings"][KEY]["session_id"])
+        self.assertIn("удалена", query.edits[-1][0])
+
+    def test_delete_confirm_refuses_active_session_and_keeps_binding(self):
+        _STATE_DATA["topic_bindings"] = {KEY: _binding_entry(SID)}
+        _seed_session(SID, lease_until=time.time() + 300)
+        query = self._tap(f"tgp:pb:delok:{SID}")
+        self.assertIn("занята", query.edits[-1][0])
+        self.assertIsNotNone(_FAKE_STATE.conn.execute(
+            "SELECT 1 FROM sessions WHERE id = ?", (SID,)).fetchone())
+        self.assertEqual(_STATE_DATA["topic_bindings"][KEY]["session_id"], SID)
+        self.assertEqual(_FakeStateDB.last_deleted, None)
+
+    def test_delete_confirm_unknown_session_shows_error(self):
+        _STATE_DATA["topic_bindings"] = {KEY: _binding_entry(None)}
+        _seed_session(SID)
+        query = self._tap("tgp:pb:delok:20269999_999999_ffffff")
+        self.assertIn("не найдена", query.edits[-1][0])
+        self.assertEqual(_FakeStateDB.last_deleted, None)
+
+    def test_delete_callback_data_fits_64_bytes(self):
+        for cb in (f"tgp:pb:del:{'a' * 46}", f"tgp:pb:delok:{'a' * 43}"):
+            self.assertLessEqual(len(cb.encode("utf-8")), 64)
+        self.assertIsNotNone(mod._PB_CB_DEL_RE.match(f"tgp:pb:del:{'a' * 46}"))
+        self.assertIsNotNone(mod._PB_CB_DEL_OK_RE.match(f"tgp:pb:delok:{'a' * 43}"))
+
+    def test_delete_confirm_rejects_session_outside_bound_project(self):
+        _STATE_DATA["topic_bindings"] = {KEY: _binding_entry(None)}
+        _FAKE_STATE.conn.execute(
+            "INSERT INTO sessions (id, source, cwd, started_at, message_count) "
+            "VALUES (?,?,?,?,?)",
+            ("20261002_101500_foreign", "telegram", "/other/project", time.time(), 5))
+        _FAKE_STATE.conn.commit()
+        query = self._tap("tgp:pb:delok:20261002_101500_foreign")
+        self.assertIn("не найдена", query.edits[-1][0])
+        self.assertIsNotNone(_FAKE_STATE.conn.execute(
+            "SELECT 1 FROM sessions WHERE id = ?",
+            ("20261002_101500_foreign",)).fetchone())
+        self.assertIsNone(_FakeStateDB.last_deleted)
 
 
 @unittest.skipUnless(_HAS_PANEL, "deploy copy has no panel code yet")
@@ -586,21 +836,26 @@ class PanelCallbackTests(_StubbedTestCase):
     def test_back_rerenders_the_panel(self):
         _STATE_DATA["topic_bindings"] = {KEY: _binding_entry(None)}
         query = self._tap("tgp:pb:back")
-        self.assertEqual(query.edits[0][0], f"📁  NeiroSlop\n🧵  —\n📂  {CWD}")
+        self.assertEqual(query.edits[0][0], f"📁  NeiroSlop  {CWD}\n🧵  —\n🤖  —")
         kb = query.edits[0][1]
         flat = [b.callback_data for row in kb.rows for b in row]
-        self.assertEqual(flat, ["tgp:pb:proj", "tgp:pb:more"])
+        self.assertEqual(flat, ["tgp:pb:proj", "tgp:pb:sess", "tgp:pb:model", "tgp:pb:more"])
 
     def test_back_with_live_session_shows_session_and_stop(self):
         _STATE_DATA["topic_bindings"] = {KEY: _binding_entry(SID)}
         _seed_session(SID, lease_until=time.time() + 300)
+        _FAKE_STATE.conn.execute(
+            "INSERT INTO gateway_routing VALUES (?, ?, ?)",
+            (f"agent:main:telegram:dm:{CHAT}", json.dumps({"session_id": SID,
+             "last_prompt_tokens": 92000}), time.time()))
         query = self._tap("tgp:pb:back")
         self.assertEqual(query.edits[0][0],
-                         f"📁  NeiroSlop\n🧵  20261003_062… · 12 msg · online\n📂  {CWD}")
+                         f"📁  NeiroSlop  {CWD}\n🧵  20261003_062… · контекст 92K · 12 msg · online\n🤖  —")
         kb = query.edits[0][1]
         flat = [b.callback_data for row in kb.rows for b in row]
-        self.assertEqual(flat, ["tgp:pb:proj", "tgp:pb:sess", "tgp:pb:stop", "tgp:pb:more"])
-        self.assertEqual([len(row) for row in kb.rows], [2, 2])
+        self.assertEqual(flat, ["tgp:pb:proj", "tgp:pb:sess", "tgp:pb:stop",
+                                "tgp:pb:model", "tgp:pb:more"])
+        self.assertEqual([len(row) for row in kb.rows], [2, 3])
 
     def test_project_command_is_menu_alias(self):
         _STATE_DATA["topic_bindings"] = {KEY: _binding_entry(None)}
@@ -611,9 +866,9 @@ class PanelCallbackTests(_StubbedTestCase):
         self.assertEqual(len(self.bot.sent), 1)
         self.assertEqual(self.bot.sent[0]["message_thread_id"], THREAD)
         self.assertEqual(self.bot.sent[0]["text"],
-                         f"📁  NeiroSlop\n🧵  —\n📂  {CWD}")
+                         f"📁  NeiroSlop  {CWD}\n🧵  —\n🤖  —")
         flat = [b.callback_data for row in self.bot.sent[0]["reply_markup"].rows for b in row]
-        self.assertEqual(flat, ["tgp:pb:proj", "tgp:pb:more"])
+        self.assertEqual(flat, ["tgp:pb:proj", "tgp:pb:sess", "tgp:pb:model", "tgp:pb:more"])
         self.assertEqual(self.bot.pinned[0]["chat_id"], int(CHAT))
         self.assertEqual(_STATE_DATA["topic_panels"][KEY],
                          self.bot.pinned[0]["message_id"])
@@ -663,7 +918,7 @@ class PanelCallbackTests(_StubbedTestCase):
         self.assertEqual(entry["project_name"], "NeiroSlop")
         self.assertEqual(entry["cwd"], CWD)
         self.assertIsNone(entry["session_id"])  # no seeded sessions: nothing to adopt
-        self.assertEqual(query.edits[-1][0], f"📁  NeiroSlop\n🧵  —\n📂  {CWD}")
+        self.assertEqual(query.edits[-1][0], f"📁  NeiroSlop  {CWD}\n🧵  —\n🤖  —")
 
     def test_projp_pick_asks_when_only_other_chat_sessions_exist(self):
         # Sessions exist in the project cwd, but NONE from this chat (e.g. a
@@ -736,6 +991,10 @@ class PanelCallbackTests(_StubbedTestCase):
     def test_sesss_pick_sets_session_and_sends_resume(self):
         _STATE_DATA["topic_bindings"] = {KEY: _binding_entry(None)}
         _seed_session(SID)
+        _FAKE_STATE.conn.execute(
+            "INSERT INTO gateway_routing VALUES (?, ?, ?)",
+            (f"agent:main:telegram:dm:{CHAT}", json.dumps({"session_id": SID,
+             "last_prompt_tokens": 92000}), time.time()))
         with _with_env(HERMES_HOME="/nonexistent-panel-tmp"):
             query = self._tap(f"tgp:pb:sesss:{SID}")
         self.assertEqual(_STATE_DATA["topic_bindings"][KEY]["session_id"], SID)
@@ -743,7 +1002,7 @@ class PanelCallbackTests(_StubbedTestCase):
                             for e in self.adapter.events))
         # the panel re-renders after the resume
         self.assertEqual(query.edits[-1][0],
-                         f"📁  NeiroSlop\n🧵  20261003_062… · 12 msg · idle\n📂  {CWD}")
+                         f"📁  NeiroSlop  {CWD}\n🧵  20261003_062… · контекст 92K · 12 msg · idle\n🤖  —")
 
     def test_sesss_pick_while_busy_defers_switch(self):
         # One turn per session: switching while the current session's turn
@@ -780,7 +1039,7 @@ class PanelCallbackTests(_StubbedTestCase):
         self.assertTrue(any(getattr(e, "text", "") == "/new"
                             for e in self.adapter.events))
         # the panel view (with buttons) is restored after the /new injection
-        self.assertEqual(query.edits[-1][0], f"📁  NeiroSlop\n🧵  —\n📂  {CWD}")
+        self.assertEqual(query.edits[-1][0], f"📁  NeiroSlop  {CWD}\n🧵  —\n🤖  —")
         self.assertIsNotNone(query.edits[-1][1])
 
     def test_stop_sends_stop_command(self):
@@ -797,14 +1056,78 @@ class PanelCallbackTests(_StubbedTestCase):
         self.assertIn("недоступна", query.edits[0][0])
         self.assertEqual(self.adapter.events, [])
 
+    def test_model_screen_sends_global_model_command(self):
+        query = self._tap("tgp:pb:model")
+        self.assertIn("ВСЕХ чатов", query.edits[0][0])
+        self.assertTrue(any(getattr(e, "text", "") == "/model --global"
+                            for e in self.adapter.events))
+
+    def test_model_screen_shows_global_note_and_back_button(self):
+        query = self._tap("tgp:pb:model")
+        datas = [b.callback_data for row in query.edits[0][1].rows for b in row]
+        self.assertIn("tgp:pb:back", datas)
+        self.assertIn("глобальная", query.edits[0][0].lower())
+
+    def test_model_screen_without_adapter_shows_note(self):
+        mod._ADAPTER = None
+        query = FakeQuery("tgp:pb:model")
+        _run(mod._handle_panel_callback(query, "tgp:pb:model"))
+        self.assertIn("недоступна", query.edits[0][0])
+        self.assertEqual(self.adapter.events, [])
+
+    def test_stats_screen_shows_session_stats(self):
+        _STATE_DATA["topic_bindings"] = {KEY: _binding_entry(SID)}
+        _seed_session(SID, model="glm-5.3-flash", in_tok=1180, out_tok=420,
+                      lease_until=time.time() + 300)
+        query = self._tap("tgp:pb:stats")
+        text, kb = query.edits[0]
+        self.assertIn(f"📊 Статистика сессии {SID}", text)
+        self.assertIn("💬 Сообщений: 12", text)
+        self.assertIn("🔤 Токены: 1600 (in 1180 / out 420)", text)
+        self.assertIn("🤖 Модель: glm-5.3-flash", text)
+        self.assertIn("⚡ Статус: online", text)
+        datas = [b.callback_data for row in kb.rows for b in row]
+        self.assertIn("tgp:pb:back", datas)
+
+    def test_stats_screen_falls_back_to_latest_cwd_session(self):
+        _STATE_DATA["topic_bindings"] = {KEY: _binding_entry(None)}
+        _seed_session(SID)  # latest own-chat session of this cwd
+        query = self._tap("tgp:pb:stats")
+        self.assertIn(f"📊 Статистика сессии {SID}", query.edits[0][0])
+
+    def test_stats_screen_without_session_shows_hint(self):
+        _STATE_DATA["topic_bindings"] = {KEY: _binding_entry(None)}
+        query = self._tap("tgp:pb:stats")
+        self.assertIn("Нет активной сессии", query.edits[0][0])
+
+    def test_stats_screen_unknown_session_shows_not_found(self):
+        _STATE_DATA["topic_bindings"] = {KEY: _binding_entry("gone-sid")}
+        query = self._tap("tgp:pb:stats")
+        self.assertIn("не найдена", query.edits[0][0])
+
     def test_more_screen_lists_commands(self):
         query = self._tap("tgp:pb:more")
         datas = [b.callback_data for row in query.edits[0][1].rows for b in row]
+        self.assertIn("tgp:pb:stats", datas)
         self.assertIn("tgp:pb:more:cmd:status", datas)
         self.assertIn("tgp:pb:more:cmd:diff", datas)
         self.assertIn("tgp:pb:more:cmd:agents", datas)
         self.assertIn("tgp:pb:more:cmd:help", datas)
         self.assertIn("tgp:pb:back", datas)
+
+    def test_more_screen_shows_current_session_delete(self):
+        _STATE_DATA["topic_bindings"] = {KEY: _binding_entry(SID)}
+        _seed_session(SID)
+        query = self._tap("tgp:pb:more")
+        datas = [b.callback_data for row in query.edits[0][1].rows for b in row]
+        self.assertIn(f"tgp:pb:del:{SID}", datas)
+
+    def test_more_screen_no_current_session_has_no_delete(self):
+        _STATE_DATA["topic_bindings"] = {KEY: _binding_entry(None)}
+        _seed_session(SID)
+        query = self._tap("tgp:pb:more")
+        datas = [b.callback_data for row in query.edits[0][1].rows for b in row]
+        self.assertNotIn("tgp:pb:del:", "".join(datas))
 
     def test_more_cmd_sends_the_command(self):
         query = self._tap("tgp:pb:more:cmd:status")
@@ -860,7 +1183,7 @@ class PanelCreateTests(_StubbedTestCase):
         kwargs = self.bot.sent[0]
         self.assertEqual(kwargs["chat_id"], CHAT)
         self.assertEqual(kwargs["message_thread_id"], THREAD)
-        self.assertEqual(kwargs["text"], "📁  —\n🧵  —\n📂  —\n\nСначала выбери проект: [📁 Проект]")
+        self.assertEqual(kwargs["text"], "📁  —  —\n🧵  —\n🤖  —\n\nСначала выбери проект: [📁 Проект]")
         self.assertEqual(kwargs["reply_markup"].rows[0][0].callback_data, "tgp:pb:proj")
         new_id = self.bot.pinned[0]["message_id"]
         self.assertEqual(self.bot.pinned[0]["chat_id"], int(CHAT))
@@ -872,12 +1195,16 @@ class PanelCreateTests(_StubbedTestCase):
         mod._pb_set_panel_message_id(CHAT, THREAD, 123)
         _STATE_DATA["topic_bindings"] = {KEY: _binding_entry(SID)}
         _seed_session(SID, lease_until=time.time() + 300)
+        _FAKE_STATE.conn.execute(
+            "INSERT INTO gateway_routing VALUES (?, ?, ?)",
+            (f"agent:main:telegram:dm:{CHAT}", json.dumps({"session_id": SID,
+             "last_prompt_tokens": 92000}), time.time()))
         self.assertTrue(_run(mod._pb_create(CHAT, THREAD)))
         self.assertEqual(self.bot.unpinned, [{"chat_id": int(CHAT), "message_id": 123}])
         self.assertEqual(self.bot.deleted, [{"chat_id": int(CHAT), "message_id": 123}])
         self.assertEqual(len(self.bot.sent), 1)
         self.assertEqual(self.bot.sent[0]["text"],
-                         f"📁  NeiroSlop\n🧵  20261003_062… · 12 msg · online\n📂  {CWD}")
+                         f"📁  NeiroSlop  {CWD}\n🧵  20261003_062… · контекст 92K · 12 msg · online\n🤖  —")
         self.assertNotEqual(mod._pb_get_panel_message_id(CHAT, THREAD), 123)
         self.assertEqual(self.bot.pinned[0]["message_id"],
                          mod._pb_get_panel_message_id(CHAT, THREAD))
@@ -929,7 +1256,7 @@ class MenuCommandTests(_StubbedTestCase):
         self.assertIsNone(result)
         self.assertEqual(len(self.bot.sent), 1)
         self.assertEqual(self.bot.sent[0]["message_thread_id"], THREAD)
-        self.assertEqual(self.bot.sent[0]["text"], f"📁  NeiroSlop\n🧵  —\n📂  {CWD}")
+        self.assertEqual(self.bot.sent[0]["text"], f"📁  NeiroSlop  {CWD}\n🧵  —\n🤖  —")
         self.assertEqual(self.bot.pinned[0]["chat_id"], int(CHAT))
         self.assertEqual(_STATE_DATA["topic_panels"][KEY],
                          self.bot.pinned[0]["message_id"])

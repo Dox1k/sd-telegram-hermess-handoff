@@ -199,7 +199,6 @@ class _FakeStateDB:
 
 _FAKE_STATE = _FakeStateDB()
 
-
 def _open_state_db_stub():
     # A close-immune proxy over the shared in-memory db: plugin flows close
     # their state connections in finally blocks, and a raw sqlite3 conn would
@@ -800,7 +799,7 @@ class SyncHookFlatTests(unittest.TestCase):
                      " '/mnt/mydisk/sd1', ?, NULL, 'Старая',"
                      " '7559860199', NULL, 3, ?)", (recent, recent))
         orig = mod._open_state_db
-        mod._open_state_db = lambda: conn
+        mod._open_state_db = lambda: _FakeConnProxy(conn)
         try:
             with _with_env(HERMES_HOME="/nonexistent-sync-tmp"):
                 result = asyncio_run(
@@ -839,7 +838,7 @@ class SyncHookFlatTests(unittest.TestCase):
         self._bind_flat()
         conn = self._bind_flat_with_old_session()
         orig = mod._open_state_db
-        mod._open_state_db = lambda: conn
+        mod._open_state_db = lambda: _FakeConnProxy(conn)
         try:
             mod._mark_new_session_grace("7559860199", None)
             with _with_env(HERMES_HOME="/nonexistent-sync-tmp"):
@@ -856,10 +855,7 @@ class SyncHookFlatTests(unittest.TestCase):
         self._bind_flat()
         conn = self._bind_flat_with_old_session(chat_id="other-chat")
         orig = mod._open_state_db
-        orig_latest = mod._latest_session_id_for_cwd
-        mod._open_state_db = lambda: conn
-        mod._latest_session_id_for_cwd = (
-            lambda cwd, chat_id=None: "" if chat_id else "s_old")
+        mod._open_state_db = lambda: _FakeConnProxy(conn)
         try:
             mod._mark_new_session_grace("7559860199", None)
             mod._NEW_SESSION_GRACE["7559860199:0"] -= mod._NEW_SESSION_GRACE_S + 1
@@ -868,7 +864,6 @@ class SyncHookFlatTests(unittest.TestCase):
                     mod._on_pre_gateway_dispatch_sync(self._event("привет"), None))
         finally:
             mod._open_state_db = orig
-            mod._latest_session_id_for_cwd = orig_latest
             conn.close()
             mod._NEW_SESSION_GRACE.clear()
         self.assertEqual(result, {"action": "skip", "reason": "awaiting_session_pick"})

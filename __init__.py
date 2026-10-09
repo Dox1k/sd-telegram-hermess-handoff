@@ -20,7 +20,11 @@ Commands
                      config.yaml's dm_topics as the fallback.
   /model             model picker, fed synthetically from the project menu's
                      "Модель" button so the gateway renders the inline provider
-                     drill-down into this chat/topic.
+                     drill-down into this chat/topic. The root panel's 🤖 Модель
+                     button sends ``/model --global`` instead: the pick is written
+                     to config.yaml (model.default) and becomes the standing
+                     model for EVERY chat; --global also clears the tapping
+                     session's override so the pick is not shadowed.
 
 Sessions (state.db is read read-only, ``WHERE cwd = ?``, no source filter — so
   desktop sessions created by the Hermes desktop app appear next to Telegram
@@ -817,6 +821,17 @@ async def _pc_reply_mirror_loop(native: Any) -> None:
             path = _hermes_home() / "state.db"
             if not bindings or not path.exists():
                 continue
+            # Refresh the TG-suppression window from the LIVE turn lease for
+            # every bound session on EVERY tick — not only when new rows exist.
+            # A long streamed turn (minutes) outlives the pre_llm_call grace
+            # (60s from turn start); without this refresh the mark goes stale
+            # mid-turn, the lease is released on completion, and the final
+            # transcript flush lands after both windows → mirrored → the
+            # adapter's own delivery is duplicated in the chat (2026-10-09).
+            for sid in bindings:
+                until = _pc_mirror_lease_tg_until(sid)
+                if until is not None and until > _PC_MIRROR_TG_UNTIL.get(sid, 0.0):
+                    _PC_MIRROR_TG_UNTIL[sid] = until
             conn = None
             rows_by_sid: Dict[str, list] = {}
             try:
@@ -854,6 +869,9 @@ async def _pc_reply_mirror_loop(native: Any) -> None:
                     with _suppress(Exception):
                         conn.close()
             for sid, rows in rows_by_sid.items():
+                # the per-tick refresh above already extended the window from
+                # the live lease; this older per-sid refresh stays for the
+                # no-lease edge (a desktop holder never suppresses).
                 until = _pc_mirror_lease_tg_until(sid)
                 if until is not None:
                     _PC_MIRROR_TG_UNTIL[sid] = until
@@ -1813,6 +1831,47 @@ def _on_session_start(**kwargs) -> None:
         logger.warning("tg-projects: on_session_start failed", exc_info=True)
 
 
+def _estimate_context_tokens(kwargs) -> int:
+    """Rough context size of the turn about to be sent (prompt side).
+
+    The core passes ``conversation_history`` (the full message list incl. the
+    current user turn) to pre_llm_call; a chars/4 estimate is within ~15% of
+    the API's tokenizer for mixed RU/EN — close enough for a panel display.
+    Used ONLY as a display fallback: providers behind bratskoe often omit
+    usage, so ``gateway_routing.last_prompt_tokens`` stays 0 and the panel
+    would show '—' even though the estimate is right there in the hook.
+    """
+    history = kwargs.get("conversation_history") or []
+    total = 0
+    for m in history:
+        if not isinstance(m, dict):
+            continue
+        content = m.get("content")
+        text = content if isinstance(content, str) else ""
+        if not text and isinstance(content, list):
+            text = " ".join(str(p.get("text") or "") for p in content
+                            if isinstance(p, dict))
+        total += len(str(text or ""))
+    return total // 4
+
+
+# session_id -> (tokens, ts): the last pre-LLM context estimate per session.
+# In-memory only (a restart resets it; the first turn after restart re-fills).
+_CTX_CACHE: Dict[str, tuple] = {}
+_CTX_CACHE_MAX = 64
+
+
+def _ctx_cache_put(session_id: str, tokens: int) -> None:
+    try:
+        if len(_CTX_CACHE) > _CTX_CACHE_MAX:
+            _drop = sorted(_CTX_CACHE.items(), key=lambda kv: kv[1][1])[:len(_CTX_CACHE) - _CTX_CACHE_MAX]
+            for k, _ in _drop:
+                _CTX_CACHE.pop(k, None)
+        _CTX_CACHE[session_id] = (tokens, time.time())
+    except Exception:
+        pass
+
+
 def _on_pre_llm_call(**kwargs) -> None:
     """Fallback cwd binder for turns ``on_session_start`` cannot see.
 
@@ -1830,12 +1889,16 @@ def _on_pre_llm_call(**kwargs) -> None:
     per turn in the TG gateway, so a turn here means the adapter delivers the
     reply itself — the PC reply mirror must not duplicate it. The desktop
     process never runs this hook, so desktop replies keep mirroring.
+
+    AND caches the turn's context-size estimate (see _estimate_context_tokens)
+    for the panel's «контекст» field.
     """
     try:
         session_id = str(kwargs.get("session_id") or kwargs.get("task_id") or "").strip()
         if not session_id:
             return
         _PC_MIRROR_TG_UNTIL[session_id] = time.time() + _PC_MIRROR_TG_GRACE_S
+        _ctx_cache_put(session_id, _estimate_context_tokens(kwargs))
         cwd, reason = None, ""
 
         binding = _get_topic_binding()
@@ -2833,9 +2896,26 @@ _PB_SESSIONS_LIMIT = 20
 _VISIBLE_SESSION_SOURCES = ("telegram", "desktop")
 _PB_CB_PROJ_RE = re.compile(r"^tgp:pb:projp:(\d+)$")
 _PB_CB_SESS_RE = re.compile(r"^tgp:pb:sesss:([A-Za-z0-9_\-]{8,46})$")
+_PB_CB_DEL_RE = re.compile(r"^tgp:pb:del:([A-Za-z0-9_\-]{8,46})$")
+# ``delok`` has a longer prefix; keep both callbacks below Telegram's 64-byte cap.
+_PB_CB_DEL_OK_RE = re.compile(r"^tgp:pb:delok:([A-Za-z0-9_\-]{8,43})$")
+
+
+def _pb_delete_callback_ids(session_id: Any) -> Optional[tuple[str, str]]:
+    """Return valid delete/confirm callback data, or None for an oversized id."""
+    sid = str(session_id or "").strip()
+    delete_cb = f"{_PB_CB_PREFIX}del:{sid}"
+    confirm_cb = f"{_PB_CB_PREFIX}delok:{sid}"
+    if (len(delete_cb.encode("utf-8")) > 64 or
+            len(confirm_cb.encode("utf-8")) > 64 or
+            _PB_CB_DEL_RE.fullmatch(delete_cb) is None or
+            _PB_CB_DEL_OK_RE.fullmatch(confirm_cb) is None):
+        return None
+    return delete_cb, confirm_cb
+
+
 _PB_CB_PICK_RE = re.compile(r"^tgp:pb:pick:([A-Za-z0-9_\-]{8,46})$")
 _PB_CB_MORE_RE = re.compile(r"^tgp:pb:more:cmd:(status|diff|agents|help)$")
-
 
 def _pb_panel_key(chat_id: Any, thread_id: Any) -> str:
     """``f"{chat_id}:{thread_id}"`` (thread 0 = plain DM panel)."""
@@ -2888,7 +2968,11 @@ def _pb_write_binding(chat_id: str, thread_id: Optional[int], project_id: Any,
                       project_name: Any, cwd: Any, session_id: Any = None) -> bool:
     """Create/refresh the binding at an explicit key; the session resets to None
     (the [📁 Проект] pick semantics: _set_topic_binding + _update_binding_session(None)).
-    ``thread_id=None`` writes the flat-lane key ``<chat>:0``."""
+    ``thread_id=None`` writes the flat-lane key ``<chat>:0``.
+
+    ``None``/empty project fields store as EMPTY strings — the "no project"
+    chat mode — never as the literal string "None" (it once rendered as
+    ``📁 None None`` in the panel)."""
     tid = 0 if thread_id is None else int(thread_id)
     key = f"{chat_id}:{tid}"
     clean = str(session_id).strip() if session_id is not None else ""
@@ -2896,9 +2980,9 @@ def _pb_write_binding(chat_id: str, thread_id: Optional[int], project_id: Any,
         state = _load_state()
         bindings = state.setdefault("topic_bindings", {})
         entry = bindings.get(key) if isinstance(bindings.get(key), dict) else {}
-        entry["project_id"] = str(project_id)
-        entry["project_name"] = str(project_name)
-        entry["cwd"] = str(cwd)
+        entry["project_id"] = str(project_id).strip() if project_id is not None else ""
+        entry["project_name"] = str(project_name).strip() if project_name is not None else ""
+        entry["cwd"] = str(cwd).strip() if cwd is not None else ""
         entry["session_id"] = clean or None
         entry["updated_at"] = int(time.time())
         bindings[key] = entry
@@ -2961,14 +3045,69 @@ def _pb_compact_tokens(in_tok: int, out_tok: int) -> str:
     return str(total)
 
 
+def _pb_compact_number(value: int) -> str:
+    """Human-readable token count (for example 92K or 1.2M)."""
+    value = max(0, int(value or 0))
+    if value >= 1_000_000:
+        return f"{value / 1_000_000:.1f}M".replace(".0M", "M")
+    if value >= 1_000:
+        return f"{round(value / 1_000)}K"
+    return str(value)
+
+
+def _pb_latest_prompt_tokens(session_id: str) -> int:
+    """Current context size: the live pre-LLM estimate, else the routing value.
+
+    The pre_llm_call hook caches a chars/4 estimate of the turn's prompt
+    (conversation_history) — the provider behind bratskoe often omits usage,
+    so ``gateway_routing.last_prompt_tokens`` stays 0. Routing remains the
+    fallback: a real API-reported number wins over the estimate.
+    """
+    try:
+        cached = _CTX_CACHE.get(str(session_id))
+        if cached and cached[0] > 0 and time.time() - cached[1] < 6 * 3600:
+            return int(cached[0])
+    except Exception:
+        pass
+    try:
+        state_conn = _sessions_state_conn()
+        try:
+            session = state_conn.execute(
+                "SELECT session_key, parent_session_id FROM sessions WHERE id = ?",
+                (session_id,),
+            ).fetchone()
+            session_key = str(session["session_key"] or "") if session else ""
+            parent_id = str(session["parent_session_id"] or "") if session else ""
+            if not session_key and parent_id:
+                parent = state_conn.execute(
+                    "SELECT session_key FROM sessions WHERE id = ?", (parent_id,)
+                ).fetchone()
+                session_key = str(parent["session_key"] or "") if parent else ""
+            if not session_key:
+                return 0
+            rows = state_conn.execute(
+                "SELECT entry_json FROM gateway_routing WHERE session_key = ? "
+                "ORDER BY updated_at DESC LIMIT 1", (session_key,),
+            ).fetchall()
+        finally:
+            with _suppress(Exception):
+                state_conn.close()
+        for row in rows:
+            entry = json.loads(row["entry_json"] or "{}")
+            return max(0, int(entry.get("last_prompt_tokens") or 0))
+    except Exception:
+        pass
+    return 0
+
+
 def _pb_panel_session_line(session_id: str, status: str) -> str:
-    """The panel's 🧵 line: the live session digest — title, volume, model."""
+    """The panel's 🧵 line: session title, context, message count, status."""
     try:
         state_conn = _sessions_state_conn()
         try:
             row = state_conn.execute(
-                "SELECT title, model, message_count, input_tokens, output_tokens"
-                " FROM sessions WHERE id = ?", (session_id,)
+                "SELECT title, model, message_count FROM sessions WHERE id = ?",
+                (session_id,),
             ).fetchone()
         finally:
             with _suppress(Exception):
@@ -2976,19 +3115,56 @@ def _pb_panel_session_line(session_id: str, status: str) -> str:
         if row is None:
             return f"{_pb_short_session_id(session_id)} · {status or 'idle'}"
         title = str(row["title"] or "").strip()
-        label = _trim(title, 24) if title and title != "(без названия)" \
+        label = _trim(title, 40) if title and title != "(без названия)" \
             else _pb_short_session_id(session_id)
-        parts = [label, f"{int(row['message_count'] or 0)} msg"]
-        tokens = _pb_compact_tokens(row["input_tokens"], row["output_tokens"])
-        if tokens != "0":
-            parts.append(tokens)
-        model = _trim(str(row["model"] or "").strip(), 18)
-        if model:
-            parts.append(model)
-        parts.append(status or "idle")
-        return " · ".join(parts)
+        context_tokens = _pb_latest_prompt_tokens(session_id)
+        context = f"{_pb_compact_number(context_tokens)}" if context_tokens else "—"
+        return f"{label} · контекст {context} · {int(row['message_count'] or 0)} msg · {status or 'idle'}"
     except Exception:
         return f"{_pb_short_session_id(session_id)} · {status or 'idle'}"
+
+
+def _pb_default_model_name() -> str:
+    """The standing global model (config.yaml model.default), '' when unreadable.
+
+    Used for the chat-mode panel line: no session is bound there, so the
+    session row has no model to show — the GLOBAL pick is what will serve.
+    """
+    try:
+        path = _hermes_home() / "config.yaml"
+        if not path.exists():
+            return ""
+        yaml = _import_hermes_module("yaml")
+        cfg = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        model_cfg = cfg.get("model")
+        if isinstance(model_cfg, str):
+            return str(model_cfg).strip()
+        if isinstance(model_cfg, dict):
+            return str(model_cfg.get("default") or "").strip()
+    except Exception:
+        pass
+    return ""
+
+
+def _pb_panel_model_line(session_id: str) -> str:
+    """The panel's 🤖 line: the bound session's model."""
+    sid = str(session_id or "").strip()
+    if not sid:
+        return "—"
+    try:
+        state_conn = _sessions_state_conn()
+        try:
+            row = state_conn.execute(
+                "SELECT model FROM sessions WHERE id = ?", (sid,)
+            ).fetchone()
+        finally:
+            with _suppress(Exception):
+                state_conn.close()
+        if row is None:
+            return "—"
+        return _trim(str(row["model"] or "").strip(), 40) or "—"
+    except Exception:
+        return "—"
 
 
 def _pb_panel_last_user_summary(session_id: str) -> str:
@@ -3009,32 +3185,34 @@ def _pb_panel_last_user_summary(session_id: str) -> str:
 
 
 def _pb_panel_text(binding: Optional[Dict[str, Any]], status: str = "") -> str:
-    """The pinned panel body: project / live session digest / cwd."""
+    """The pinned panel body: project cwd / live session digest / cwd."""
     if not binding:
-        return "📁  —\n🧵  —\n📂  —\n\nСначала выбери проект: [📁 Проект]"
+        return "📁  —  —\n🧵  —\n🤖  —\n\nСначала выбери проект: [📁 Проект]"
     project_name = str(binding.get("project_name") or "").strip()
     cwd = str(binding.get("cwd") or "").strip()
     if not project_name and not cwd:
-        return "💬  Разговорник (без проекта)\n🧵  —\n📂  —"
+        # Chat mode: no session bound — show the standing GLOBAL model
+        # (config.yaml model.default) instead of a bare '—'.
+        return f"💬  Разговорник (без проекта)\n🧵  —\n🤖  {_pb_default_model_name() or '—'}"
     session_id = str(binding.get("session_id") or "").strip()
     session_line = _pb_panel_session_line(session_id, status) if session_id else "—"
+    model_line = _pb_panel_model_line(session_id) if session_id else "—"
     summary = _pb_panel_last_user_summary(session_id) if session_id else ""
     tail = f"\n🗒  {summary}" if summary else ""
     return (
-        f"📁  {project_name or '—'}\n"
+        f"📁  {project_name or '—'}  {cwd or '—'}\n"
         f"🧵  {session_line}\n"
-        f"📂  {cwd or '—'}{tail}"
+        f"🤖  {model_line}{tail}"
     )
 
 
 def _pb_panel_keyboard(binding: Optional[Dict[str, Any]] = None, status: str = ""):
     """Compact primary keyboard: contextual Session/Stop, always Проект + Ещё."""
     from telegram import InlineKeyboardButton, InlineKeyboardMarkup
-    session_id = ""
-    if binding:
-        session_id = str(binding.get("session_id") or "").strip()
-    show_session = bool(session_id)
-    show_stop = show_session and str(status or "").lower() == "online"
+    show_session = bool(binding and (str(binding.get("project_id") or "").strip() or
+                                     str(binding.get("project_name") or "").strip() or
+                                     str(binding.get("cwd") or "").strip()))
+    show_stop = bool(show_session and str(status or "").lower() == "online")
     rows: list = []
     first_row = [InlineKeyboardButton("📁 Проект", callback_data=f"{_PB_CB_PREFIX}proj")]
     if show_session:
@@ -3043,6 +3221,7 @@ def _pb_panel_keyboard(binding: Optional[Dict[str, Any]] = None, status: str = "
     second_row: list = []
     if show_stop:
         second_row.append(InlineKeyboardButton("⏹ Stop", callback_data=f"{_PB_CB_PREFIX}stop"))
+    second_row.append(InlineKeyboardButton("🤖 Модель", callback_data=f"{_PB_CB_PREFIX}model"))
     second_row.append(InlineKeyboardButton("⚙️ Ещё", callback_data=f"{_PB_CB_PREFIX}more"))
     rows.append(second_row)
     return InlineKeyboardMarkup(rows)
@@ -3319,11 +3498,12 @@ async def _pb_sessions_screen(query, chat_id: str, thread_id: Optional[int]) -> 
             with _suppress(Exception):
                 state_conn.close()
     from telegram import InlineKeyboardButton, InlineKeyboardMarkup
-    rows = [[InlineKeyboardButton(
-                 f"▶️ {('🖥️ ' if s.get('source') == 'desktop' else '')}"
-                 f"{_pb_session_label(s)} · {s.get('status') or 'idle'}",
-                 callback_data=f"{_PB_CB_PREFIX}sesss:{s['id']}")]
-            for s in sessions]
+    rows = []
+    for s in sessions:
+        rows.append([InlineKeyboardButton(
+            f"▶️ {('🖥️ ' if s.get('source') == 'desktop' else '')}"
+            f"{_pb_session_label(s)} · {s.get('status') or 'idle'}",
+            callback_data=f"{_PB_CB_PREFIX}sesss:{s['id']}")])
     rows.append([InlineKeyboardButton("➕ Новая сессия", callback_data=f"{_PB_CB_PREFIX}new")])
     rows.append([InlineKeyboardButton("⬅️ Назад", callback_data=f"{_PB_CB_PREFIX}back")])
     with _suppress(Exception):
@@ -3416,6 +3596,135 @@ async def _pb_pick_session_flow(query, chat_id: str, thread_id: Optional[int],
     await _pb_render(query, chat_id, thread_id)
 
 
+async def _pb_delete_confirm_screen(query, chat_id: str, thread_id: Optional[int], session_id: str) -> None:
+    """A tgp:pb:del:<id> tap: explicit delete confirmation."""
+    state_conn = _sessions_state_conn()
+    try:
+        row = state_conn.execute(
+            "SELECT id, title, message_count, cwd FROM sessions WHERE id = ?",
+            (session_id,),
+        ).fetchone()
+    except Exception:
+        row = None
+    finally:
+        with _suppress(Exception):
+            state_conn.close()
+    if row is None:
+        with _suppress(Exception):
+            await query.edit_message_text(
+                f"❌ Сессия {session_id} не найдена — обновите список: [⬅️ Назад].",
+                reply_markup=_pb_back_keyboard())
+        return
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+    title = str(row["title"] or "").strip() or _pb_short_session_id(str(row["id"]))
+    callbacks = _pb_delete_callback_ids(session_id)
+    if callbacks is None:
+        with _suppress(Exception):
+            await query.edit_message_text(
+                "❌ Идентификатор сессии слишком длинный для кнопки Telegram.",
+                reply_markup=_pb_back_keyboard())
+        return
+    rows = [
+        [InlineKeyboardButton(f"✅ Да, удалить «{title}»",
+                              callback_data=callbacks[1])],
+        [InlineKeyboardButton("⬅️ Назад", callback_data=f"{_PB_CB_PREFIX}back")],
+    ]
+    with _suppress(Exception):
+        await query.edit_message_text(
+            f"⚠️ Удалить сессию «{title}»?\n\n"
+            f"🆔 {row['id']}\n"
+            f"💬 {row['message_count'] or 0} msg\n"
+            f"📂 {row['cwd'] or 'каталог не указан'}\n\n"
+            "Это необратимо: сессия и её сообщения будут удалены.",
+            reply_markup=InlineKeyboardMarkup(rows))
+
+
+async def _pb_delete_session(query, chat_id: str, thread_id: Optional[int],
+                             session_id: str) -> None:
+    """A tgp:pb:delok:<id> tap: guarded permanent delete + binding cleanup."""
+    binding = _pb_binding(chat_id, thread_id)
+    state_conn = _sessions_state_conn()
+    try:
+        row = state_conn.execute(
+            "SELECT id, cwd, source FROM sessions WHERE id = ?",
+            (session_id,)).fetchone()
+        columns = _columns_of(state_conn, "sessions")
+        parent = None
+        if row is not None and "parent_session_id" in columns:
+            parent = state_conn.execute(
+                "SELECT parent_session_id FROM sessions WHERE id = ?",
+                (session_id,)).fetchone()["parent_session_id"]
+        status = _pb_session_status(state_conn, session_id) if row is not None else ""
+    finally:
+        with _suppress(Exception):
+            state_conn.close()
+    bound_cwd = str((binding or {}).get("cwd") or "").strip()
+    row_cwd = str(row["cwd"] or "").strip() if row is not None else ""
+    source = str(row["source"] or "").strip() if row is not None else ""
+    if (row is not None and
+            (not bound_cwd or os.path.realpath(row_cwd) != os.path.realpath(bound_cwd) or
+             source not in _VISIBLE_SESSION_SOURCES or parent)):
+        row = None
+    if row is None:
+        with _suppress(Exception):
+            await query.edit_message_text(
+                f"❌ Сессия {session_id} не найдена — обновите список: [⬅️ Назад].",
+                reply_markup=_pb_back_keyboard())
+        return
+    if str(status or "").lower() == "online":
+        with _suppress(Exception):
+            await query.edit_message_text(
+                f"⛔ Сессия {_pb_short_session_id(session_id)} занята (идёт ход). "
+                "Дождись ответа или нажми [⏹ Stop], затем удаляй.",
+                reply_markup=_pb_back_keyboard())
+        return
+    deleted = False
+    err = None
+    try:
+        db_path = _hermes_home() / "state.db"
+        sessions_dir = _hermes_home() / "sessions"
+        db = _import_hermes_module("hermes_state", "SessionDB")(db_path)
+        try:
+            deleted = db.delete_session(session_id, sessions_dir=sessions_dir,
+                                        exclude_active_write_guards=True)
+        finally:
+            with _suppress(Exception):
+                db.close()
+    except Exception as exc:
+        err = exc
+        logger.warning("tg-projects: delete session %s failed: %s",
+                       session_id, exc, exc_info=True)
+    if not deleted:
+        if err is not None:
+            with _suppress(Exception):
+                await query.edit_message_text(
+                    f"⚠️ Сессию {_pb_short_session_id(session_id)} удалить не удалось — см. лог hermes.",
+                    reply_markup=_pb_back_keyboard())
+        else:
+            with _suppress(Exception):
+                await query.edit_message_text(
+                    f"❌ Сессия {_pb_short_session_id(session_id)} не найдена — обновите список: [⬅️ Назад].",
+                    reply_markup=_pb_back_keyboard())
+        return
+    binding = _pb_binding(chat_id, thread_id)
+    if binding and str(binding.get("session_id") or "").strip() == session_id:
+        _pb_write_binding_session(chat_id, thread_id, None)
+    with _CWD_LOCK:
+        state = _load_state()
+        changed = False
+        for key, entry in (state.get("topic_bindings") or {}).items():
+            if isinstance(entry, dict) and str(entry.get("session_id") or "").strip() == session_id:
+                entry["session_id"] = None
+                changed = True
+        if changed:
+            _save_state(state)
+    with _suppress(Exception):
+        await query.edit_message_text(
+            f"✅ Сессия {_pb_short_session_id(session_id)} удалена.\n"
+            "Если она была закреплена за этим чатом, тема снова в режиме «проект без активной сессии».",
+            reply_markup=_pb_back_keyboard())
+
+
 async def _pb_pick_session(query, chat_id: str, thread_id: Optional[int],
                            session_id: str) -> None:
     """A tgp:pb:sesss:<id> tap: bind the session, resume it, re-render the panel."""
@@ -3504,11 +3813,99 @@ async def _pb_stop(query) -> None:
     await _send_gateway_command(query, "/stop")
 
 
-async def _pb_more_screen(query) -> None:
+async def _pb_model_screen(query) -> None:
+    """[🤖 Модель]: global model picker for the whole bot.
+
+    Feeds a synthetic ``/model --global`` into the gateway: the core renders its
+    inline provider→model drill-down into this chat/topic, and the picked model
+    is written to config.yaml (model.default) — the standing route for EVERY
+    chat, not a session-only override. ``--global`` also clears this session's
+    stale override (gateway/slash_commands_model.py precedence: session >
+    channel > config), so the pick is not shadowed.
+    """
+    if _ADAPTER is None:
+        with _suppress(Exception):
+            await query.edit_message_text("⚠️ Смена модели сейчас недоступна (адаптер не подключён).",
+                                          reply_markup=_pb_back_keyboard())
+        return
+    with _suppress(Exception):
+        await query.edit_message_text(
+            "🤖 Модель — глобальная смена модели для ВСЕХ чатов бота.\n"
+            "Отправляю /model --global — ниже появятся кнопки выбора провайдера и модели.\n"
+            "Выбранная модель запишется в конфиг и будет использоваться во всех чатах.",
+            reply_markup=_pb_back_keyboard(),
+        )
+    await _send_gateway_command(query, "/model --global")
+
+
+async def _pb_stats_screen(query, chat_id: str, thread_id: Optional[int]) -> None:
+    """[📊 Статистика]: current session stats from state.db.
+
+    Reads the binding's session_id, falls back to the cwd's latest own-chat
+    session (same rule as the project pick auto-adopt), then renders identity,
+    volume (messages / tokens in+out), model, start time, last activity, status
+    and the last user line — the same fields the enter-summary shows.
+    """
+    binding = _pb_binding(chat_id, thread_id)
+    current_sid = str((binding or {}).get("session_id") or "").strip()
+    if not current_sid:
+        cwd = str((binding or {}).get("cwd") or "").strip()
+        if cwd:
+            current_sid = _latest_session_id_for_cwd(cwd, chat_id=chat_id)
+    if not current_sid:
+        with _suppress(Exception):
+            await query.edit_message_text(
+                "📊 Нет активной сессии — сначала выбери или создай её ([📁 Проект] / [🆕 Новая]).",
+                reply_markup=_pb_back_keyboard())
+        return
+    state_conn = _sessions_state_conn()
+    try:
+        row = state_conn.execute(
+            "SELECT id, title, model, started_at, message_count,"
+            " input_tokens, output_tokens, last_activity_at"
+            " FROM sessions WHERE id = ?", (current_sid,)
+        ).fetchone()
+        if row is None:
+            text = f"📊 Сессия {current_sid} не найдена в базе."
+        else:
+            in_tok, out_tok = int(row["input_tokens"] or 0), int(row["output_tokens"] or 0)
+            status = _pb_session_status(state_conn, current_sid)
+            title = str(row["title"] or "").strip()
+            lines = [
+                f"📊 Статистика сессии {current_sid}",
+                f"🗣 Название: {title or '(без названия)'}",
+                f"💬 Сообщений: {int(row['message_count'] or 0)}",
+                f"🔤 Токены: {in_tok + out_tok} (in {in_tok} / out {out_tok})",
+                f"🤖 Модель: {row['model'] or 'не указана'}",
+                f"🕐 Старт: {_fmt_ts(row['started_at'])}",
+            ]
+            if row["last_activity_at"]:
+                lines.append(f"🕐 Активность: {_fmt_ts(row['last_activity_at'])}")
+            lines.append(f"⚡ Статус: {status or 'idle'}")
+            text = "\n".join(lines)
+    except Exception as exc:
+        text = f"📊 Не удалось прочитать статистику: {exc}"
+    finally:
+        with _suppress(Exception):
+            state_conn.close()
+    with _suppress(Exception):
+        await query.edit_message_text(text, reply_markup=_pb_back_keyboard())
+
+
+async def _pb_more_screen(query, chat_id: str, thread_id: Optional[int]) -> None:
     """[⚙️ Ещё]: the reference-command sub-menu."""
     from telegram import InlineKeyboardButton, InlineKeyboardMarkup
     rows = [[InlineKeyboardButton(f"/{name}", callback_data=f"{_PB_CB_PREFIX}more:cmd:{name}")]
             for name in ("status", "diff", "agents", "help")]
+    rows.insert(0, [InlineKeyboardButton("📊 Статистика сессии",
+                                         callback_data=f"{_PB_CB_PREFIX}stats")])
+    binding = _pb_binding(chat_id, thread_id)
+    current_sid = str((binding or {}).get("session_id") or "").strip()
+    if current_sid:
+        callbacks = _pb_delete_callback_ids(current_sid)
+        if callbacks is not None:
+            rows.append([InlineKeyboardButton(f"🗑 Удалить текущую сессию: {_pb_short_session_id(current_sid)}",
+                                              callback_data=callbacks[0])])
     rows.append([InlineKeyboardButton("⬅️ Назад", callback_data=f"{_PB_CB_PREFIX}back")])
     with _suppress(Exception):
         await query.edit_message_text(
@@ -3551,8 +3948,12 @@ async def _handle_panel_callback(query, data: str) -> None:
             await _pb_chat_mode(query, chat_id, thread_id)
         elif rest == "stop":
             await _pb_stop(query)
+        elif rest == "model":
+            await _pb_model_screen(query)
+        elif rest == "stats":
+            await _pb_stats_screen(query, chat_id, thread_id)
         elif rest == "more":
-            await _pb_more_screen(query)
+            await _pb_more_screen(query, chat_id, thread_id)
         else:
             m = _PB_CB_PROJ_RE.match(data)
             if m is not None:
@@ -3566,9 +3967,17 @@ async def _handle_panel_callback(query, data: str) -> None:
                     if m is not None:
                         await _pb_pick_session(query, chat_id, thread_id, m.group(1))
                     else:
-                        m = _PB_CB_MORE_RE.match(data)
+                        m = _PB_CB_DEL_RE.match(data)
                         if m is not None:
-                            await _pb_run_command(query, m.group(1))
+                            await _pb_delete_confirm_screen(query, chat_id, thread_id, m.group(1))
+                        else:
+                            m = _PB_CB_DEL_OK_RE.match(data)
+                            if m is not None:
+                                await _pb_delete_session(query, chat_id, thread_id, m.group(1))
+                            else:
+                                m = _PB_CB_MORE_RE.match(data)
+                                if m is not None:
+                                    await _pb_run_command(query, m.group(1))
         with _suppress(Exception):
             await query.answer()
     except Exception as exc:
